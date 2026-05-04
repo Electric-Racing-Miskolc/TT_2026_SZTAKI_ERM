@@ -1,0 +1,5 @@
+mujoco==3.8.0
+numpy
+opencv-python
+mediapipe
+pytest
