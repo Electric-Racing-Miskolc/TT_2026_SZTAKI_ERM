@@ -1,9 +1,9 @@
-# Real2Sim — Unitree G1 webkamerás vezérlés
+# Real2Sim — Unitree G1 webkamerás vezérlés (mink IK)
 
 Felsőtest-utánzó "real2sim" rendszer: a laptop webkamerája figyeli az operátor
-mozgását, és a karok pózát (váll pitch / roll / yaw + könyök) átültetjük egy
-Unitree G1 humanoid modellre MuJoCo-ban valós időben. A demó videó osztott
-képernyőn mutatja a kamerát (skeleton overlay-jel) és a szimulációt.
+mozgását, és a karok pózát egy **mink differenciális IK** solver segítségével
+ültetjük át egy Unitree G1 humanoid modellre MuJoCo-ban valós időben.  A demó
+videó osztott képernyőn mutatja a kamerát (skeleton overlay-jel) és a szimulációt.
 
 A SZTAKI ERM 2026 tervezési feladata. Licensz: **CC0 1.0 Universal**.
 
@@ -12,42 +12,45 @@ A SZTAKI ERM 2026 tervezési feladata. Licensz: **CC0 1.0 Universal**.
 ## Architektúra
 
 ```
-Webkamera → MediaPipe Pose (Tasks API) → 8-D ízületi szögvektor (retarget)
-                                                  │
-                                          exp. simítás (α=0.4)
-                                                  │
-                              MuJoCo G1 (8 position aktuátor, torzo rögzítve)
-                                                  │
-                          osztott képernyős mp4 (kamera | sim) — opcionális
+Webkamera → MediaPipe Pose (Tasks API)
+                │ 33 világ-landmark (méter, csípő-centrált)
+         One-Euro szűrő (adaptív simítás, 33×3 csatorna)
+                │
+         T-pose kalibráció (induláskor, egyszer)
+         → kar-arány skálázás (user ↔ G1)
+                │
+         mink FrameTask IK
+         tasks: left_palm + right_palm site célok (14 DoF / 2 kar)
+         solver: daqp (CPU, ~1 ms / frame)
+                │
+         MuJoCo G1 (pozíció-aktuátorok, torzo rögzítve)
+                │
+         split-screen mp4 / passzív viewer
 ```
 
-- **Computer vision**: Google MediaPipe Pose (Tasks API). 33 testpont,
-  hip-centered méter-skálás 3D koordináták. CPU-n fut, ~30 ms / frame.
+- **Computer vision**: Google MediaPipe Pose (Tasks API). 33 testpont, hip-centered 3D.
+- **Szűrés**: One-Euro Filter — adaptív cutoff, kevesebb lag mint EMA.
+- **Kalibráció**: T-pose indításkor → kar-arány skálázó (`models/calibration.json`).
 - **Fizika**: MuJoCo 3.8 + `mujoco_menagerie/unitree_g1` MJCF.
-- **Vezérlés**: 4 DoF / kar (váll pitch + roll + yaw, könyök).
-- **OpenClaw integráció**: a pipeline egy openclaw skill-ként is elérhető
-  (`openclaw/skills/real2sim/`), ami subprocess-ként indítja-leállítja.
+- **IK**: mink (Apache-2.0) differenciális IK + daqp QP solver.
+- **openclaw**: a pipeline skill-wrapper-ként elérhető (`openclaw/skills/real2sim/`).
 
 ## Telepítés (Windows, bash / Git Bash)
 
 ```bash
 # 1. Klónozás
-git clone https://github.com/Electric-Racing-Miskolc/TT_2026_SZTAKI_ERM.git
+git clone https://github.com/<repo>/TT_2026_SZTAKI_ERM.git
 cd TT_2026_SZTAKI_ERM
 
-# 2. Submodule-ok / külső repo-k
-#   - mujoco_menagerie  (Unitree G1 MJCF)
-#   - openclaw          (skill orchestrátor)
-# Ha nem submodule-ként vannak, klónozd külön:
-#   git clone https://github.com/google-deepmind/mujoco_menagerie.git
-#   git clone https://github.com/openclaw/openclaw.git
+# 2. Unitree G1 MJCF (szükséges, nem tracked a repóban)
+git clone https://github.com/google-deepmind/mujoco_menagerie.git
 
 # 3. Python venv
 python -m venv real2sim_env
-source real2sim_env/Scripts/activate    # Windows
+source real2sim_env/Scripts/activate    # Windows Git Bash
 # source real2sim_env/bin/activate       # Linux/macOS
 
-# 4. Dep-ek
+# 4. Függőségek
 pip install -r requirements.txt
 
 # 5. MediaPipe pose modell (~9 MB)
@@ -59,17 +62,20 @@ curl -L -o models/pose_landmarker_full.task \
 ## Használat
 
 ```bash
-# Csak kamera + skeleton overlay (gyors hardver-ellenőrzés)
-python scripts/run_real2sim.py --pose-only
-
-# Élő szimuláció + viewer (a karok valós időben követik a felhasználót)
+# Első futtatás — T-pose kalibráció + élő szimuláció
 python scripts/run_real2sim.py --viewer
 
-# Demo mp4 felvétele 20 másodpercig (offscreen render, split-screen)
+# Kalibráció újrafuttatása
+python scripts/run_real2sim.py --viewer --recalibrate
+
+# Demo mp4 felvétele 20 másodpercig
 python scripts/run_real2sim.py --record demo.mp4 --duration 20
 
-# Debug: 30 frame-enként kiírja az aktuális ízületi szögeket
-python scripts/run_real2sim.py --viewer --debug
+# Csak kamera + skeleton overlay (hardver-ellenőrzés, szimuláció nélkül)
+python scripts/run_real2sim.py --pose-only
+
+# IK hibakeresés (joint-szögek 30 frame-enként)
+python scripts/run_real2sim.py --viewer --ik-debug
 ```
 
 ### CLI kapcsolók
@@ -81,8 +87,13 @@ python scripts/run_real2sim.py --viewer --debug
 | `--record PATH` | Split-screen mp4 írása |
 | `--duration N` | N másodperc után megáll (0 = `q`-ig) |
 | `--camera IDX` | Kamera index (default 0) |
-| `--no-mirror` | Ne tükrözze a kamera képet a megjelenítéskor |
-| `--debug` | Periodikus szög-printek |
+| `--recalibrate` | T-pose kalibráció újrafuttatása |
+| `--ik-debug` | IK joint-szögek periodikus kiírása |
+| `--no-mirror` | Ne tükrözze a kamera képet |
+
+### T-pose kalibráció
+
+Az első indításkor (vagy `--recalibrate` flaggel) a rendszer megkér, hogy 3 másodpercig tartsd T-pózban a karjaid (oldalra kinyújtva). Ezalatt méri a váll-csukló távolságodat, és kiszámít egy skálázót (`scale = G1_kar / te_kared`). Az eredmény a `models/calibration.json`-ba kerül, és következő indításkor automatikusan betöltődik.
 
 ### OpenClaw skill
 
@@ -90,77 +101,86 @@ python scripts/run_real2sim.py --viewer --debug
 python openclaw/skills/real2sim/scripts/run.py --action status
 python openclaw/skills/real2sim/scripts/run.py --action start
 python openclaw/skills/real2sim/scripts/run.py --action stop
+python openclaw/skills/real2sim/scripts/run.py --action calibrate
 python openclaw/skills/real2sim/scripts/run.py --action record --out demo.mp4 --duration 20
 ```
-
-A skill manifest leírása: [openclaw/skills/real2sim/SKILL.md](openclaw/skills/real2sim/SKILL.md).
 
 ## Tesztelés
 
 ```bash
-# Retarget matematika unit tesztek
-python -m pytest tests/test_retarget.py -v
+# Kalibráció matematika unit tesztek (kamera nélkül)
+python -m pytest tests/test_calibration.py -v
+
+# IK integráció tesztek (szükséges: mujoco_menagerie + mink)
+python -m pytest tests/test_ik.py -v
+
+# Kamera-diagnosztika
+python tests/camera_diag.py
 
 # End-to-end szintetikus pipeline (kamera nélkül, mp4-et ír)
 python tests/smoke_pipeline_synth.py
-
-# Kamera-diagnosztika (engedélyek + index)
-python tests/camera_diag.py
-
-# Pose modell live tesztje (kamera szükséges)
-python tests/smoke_pose.py
 ```
 
 ## Projekt szerkezet
 
 ```
-real2sim/                     fő csomag
-├── config.py                 konstansok (joint nevek, FPS, modell útvonal)
-├── pose.py                   MediaPipe Tasks wrapper
-├── retarget.py               landmark → 8 ízületi szög (numpy-only)
-├── filter.py                 exponenciális simítás
-├── sim.py                    MuJoCo G1 wrapper, torzo rögzítés
-├── recorder.py               cv2.VideoWriter split-screen
-└── runner.py                 fő ciklus (capture → pose → ctrl → step → render)
+real2sim/
+├── config.py          konstansok (joint nevek, IK paraméterek, FPS)
+├── pose.py            MediaPipe Tasks API wrapper
+├── one_euro.py        One-Euro adaptív szűrő (landmark array)
+├── calibration.py     T-pose kalibráció, arm-arány skálázás
+├── ik.py              mink FrameTask IK (left_palm + right_palm, 14 DoF)
+├── sim.py             MuJoCo G1 wrapper (runtime MJCF patch, torzo pin)
+├── filter.py          limit_delta segédfüggvény
+└── runner.py          fő ciklus (calibrate → capture → IK → step → render)
 
 scripts/
-└── run_real2sim.py           CLI
+└── run_real2sim.py    CLI belépési pont
 
 openclaw/skills/real2sim/
-├── SKILL.md                  openclaw skill manifest
-└── scripts/run.py            start / stop / status / record orchestrátor
+├── SKILL.md           openclaw skill manifest
+└── scripts/run.py     start / stop / status / record / calibrate
 
 tests/
-├── test_retarget.py          unit tesztek 6 szintetikus pózra
-├── smoke_pose.py             webkamera live póz teszt
-├── smoke_pipeline_synth.py   end-to-end mp4 kamera nélkül
-└── camera_diag.py            kamera index és engedély-diagnosztika
+├── test_calibration.py  kalibráció unit tesztek
+├── test_ik.py           mink IK integráció tesztek
+├── smoke_pose.py        webkamera live póz teszt
+├── smoke_pipeline_synth.py  end-to-end mp4 kamera nélkül
+└── camera_diag.py       kamera index és engedély-diagnosztika
 
-mujoco_menagerie/             külső, BSD-3 (Google DeepMind)
-openclaw/                     külső, MIT
+models/
+└── pose_landmarker_full.task   MediaPipe modell (nem tracked)
+    calibration.json            T-pose skálázó cache (generált)
+
+mujoco_menagerie/   Google DeepMind (Apache-2.0, nem tracked)
+openclaw/           MIT licensz
 ```
 
-## Pose → ízület leképezés
+## Pose → IK leképezés
 
-A `retarget.py` egy testkeretet épít vállak + csípők alapján
-(`e_x`=alany bal, `e_z`=gerinc fel, `e_y`=mellkasból kifelé). Minden karra:
+A `real2sim/ik.py` minden kép-kockán:
 
-```
-shoulder_pitch = atan2(uy, -uz)               # uy/uz = felkar y/z testkeretben
-shoulder_roll  = asin(±ux)                    # + bal, − jobb
-shoulder_yaw   = atan2(f_pr.x, f_pr.y)        # alkar a pitch+roll utáni keretben
-elbow          = acos(dot(unit_upper, unit_forearm))
-```
+1. **Body frame** épül a vállak + csípők alapján (e_x=bal, e_z=fel, e_y=előre).
+2. A csukló vektora a vállhoz képest **testkeretbe forgatódik**, majd **skálázódik**
+   a G1/user arány szerint.
+3. A skálázott vektor visszakerül a **robot MuJoCo-világ keretébe** (torso xmat
+   alapján kiszámított 3×3 mátrix).
+4. A `mink.FrameTask` felveszi a bal/jobb `left_palm`/`right_palm` site célokat,
+   és a `daqp` solver megoldja a `qvel` vektort.
+5. A `mink.Configuration.integrate_inplace()` elvégzi az integrálást; az eredmény
+   qpos a pozíció-aktuátorokhoz kerül (`data.ctrl`).
 
-A jobb karon az `ux` előjelét és a `yaw` előjelét fordítjuk, hogy a G1
-aszimmetrikus joint range-eivel egyezzen (lásd `tests/test_retarget.py`).
+Az MJCF `left_palm`/`right_palm` site-ok runtime kerülnek be (nem módosítjuk a
+submodule fájlját): a `sim.py` induláskor kétszer beilleszti a site-sort a g1.xml
+tartalmába és ideiglenes fájlba ment, majd betöltés után törli.
 
 ## Licensz
 
 Ez a repo **CC0 1.0 Universal** licenszű (lásd [LICENSE](LICENSE)). Külső
-komponensek a saját licenszüket örzik:
+komponensek a saját licenszüket örlik:
 
 - [mujoco_menagerie](mujoco_menagerie/LICENSE) — Apache 2.0
 - [unitree_g1 MJCF](mujoco_menagerie/unitree_g1/LICENSE) — BSD-3
 - [openclaw](openclaw/LICENSE) — MIT
+- [mink](https://github.com/kevinzakka/mink) — Apache 2.0
 - [MediaPipe](https://github.com/google-ai-edge/mediapipe) — Apache 2.0

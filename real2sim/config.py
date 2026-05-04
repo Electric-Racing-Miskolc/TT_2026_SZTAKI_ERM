@@ -1,54 +1,66 @@
-"""Project-wide constants for Real2Sim."""
+"""Project-wide constants for Real2Sim (mink IK edition)."""
 
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MODEL_PATH = PROJECT_ROOT / "mujoco_menagerie" / "unitree_g1" / "scene.xml"
+MODEL_PATH   = PROJECT_ROOT / "mujoco_menagerie" / "unitree_g1" / "scene.xml"
 KEYFRAME_NAME = "stand"
 
-# Eight upper-body actuators we drive. Order matters: it defines the angle vector layout.
-JOINT_NAMES = (
+# Calibration cache (overwritten each recalibration).
+CALIBRATION_PATH = PROJECT_ROOT / "models" / "calibration.json"
+
+# ── Arm joints driven by IK (14 total, L then R) ────────────────────────────
+ARM_JOINT_NAMES = (
     "left_shoulder_pitch_joint",
     "left_shoulder_roll_joint",
     "left_shoulder_yaw_joint",
     "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
     "right_shoulder_pitch_joint",
     "right_shoulder_roll_joint",
     "right_shoulder_yaw_joint",
     "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
 )
 
-# MediaPipe Pose landmark indices we care about.
-LM_LEFT_SHOULDER = 11
+# Sites that mink targets (must be present in the patched MJCF).
+IK_SITE_LEFT  = "left_palm"
+IK_SITE_RIGHT = "right_palm"
+
+# ── MediaPipe landmark indices ───────────────────────────────────────────────
+LM_LEFT_SHOULDER  = 11
 LM_RIGHT_SHOULDER = 12
-LM_LEFT_ELBOW = 13
-LM_RIGHT_ELBOW = 14
-LM_LEFT_WRIST = 15
-LM_RIGHT_WRIST = 16
-LM_LEFT_HIP = 23
-LM_RIGHT_HIP = 24
+LM_LEFT_ELBOW     = 13
+LM_RIGHT_ELBOW    = 14
+LM_LEFT_WRIST     = 15
+LM_RIGHT_WRIST    = 16
+LM_LEFT_HIP       = 23
+LM_RIGHT_HIP      = 24
 
 VISIBILITY_THRESHOLD = 0.5
 
-# Joint-angle smoother: lower = smoother/more lag. 0.15 keeps motion fluid
-# while cutting out per-frame noise.
-SMOOTHING_ALPHA = 0.15
+# ── IK solver ────────────────────────────────────────────────────────────────
+IK_SOLVER       = "daqp"       # CPU-friendly QP solver
+IK_POSTURE_COST = 1e-3         # Regularisation; keep arms near natural rest
+IK_DT           = 1.0 / 30.0  # Integration step (matches TARGET_FPS)
 
-# Landmark position smoother (applied BEFORE angle math).
-# Stabilises the body frame and reduces input noise.
-LANDMARK_SMOOTH_ALPHA = 0.25
+# ── Calibration ──────────────────────────────────────────────────────────────
+CALIB_COUNTDOWN_S = 3.0   # "Hold T-pose" on-screen timer before collecting
+CALIB_COLLECT_S   = 1.5   # Seconds of frames averaged for calibration
+CALIB_SCALE_MIN   = 0.4   # Safety clamp: robot / person arm-length ratio
+CALIB_SCALE_MAX   = 1.8
 
-# Maximum joint-angle change per frame (velocity clamp). Prevents the sudden
-# jumps that occur near gimbal-lock configurations or when MediaPipe drops
-# and re-detects a landmark.
-import math as _math
-MAX_ANGLE_DELTA_RAD = _math.radians(8.0)
+# ── One-Euro filter (applied to raw MediaPipe world landmarks) ───────────────
+OEF_MIN_CUTOFF = 1.0   # Hz — base smoothing
+OEF_BETA       = 0.05  # Speed coupling (higher → less lag on fast motion)
+OEF_D_CUTOFF   = 1.0   # Hz — derivative cutoff
 
-# Shoulder yaw (axial twist of upper arm) is unreliable from a single camera.
-# Scale it toward zero to avoid chaotic motion on that axis.
-YAW_SCALE = 0.0
-
+# ── Camera / recording ───────────────────────────────────────────────────────
 CAMERA_INDEX = 0
-FRAME_W = 640
-FRAME_H = 480
-TARGET_FPS = 30
+FRAME_W      = 640
+FRAME_H      = 480
+TARGET_FPS   = 30

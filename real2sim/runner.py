@@ -1,16 +1,17 @@
-"""Main loop tying webcam -> pose -> retarget -> filter -> sim -> render.
+"""Main loop: webcam → MediaPipe → One-Euro filter → mink IK → MuJoCo.
 
-Modes:
-    --pose-only            no MuJoCo, just shows the camera + skeleton
-    --viewer               live MuJoCo viewer + camera window
-    --record OUT [--duration N]  offscreen render + mp4 split-screen
+Modes
+-----
+--pose-only     webcam + skeleton overlay, no simulation.
+--viewer        live MuJoCo passive viewer + camera preview window.
+--record PATH   offscreen split-screen mp4 (camera | sim).
 """
 
 from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -19,78 +20,141 @@ import mujoco.viewer
 import numpy as np
 
 from . import config
-from .filter import ExpSmoother, LandmarkSmoother, limit_delta
+from .calibration import BodyCalibration, run_calibration
+from .ik import ArmIK
+from .one_euro import OneEuroFilterArray
 from .pose import PoseEstimator, PoseResult
 from .recorder import SplitScreenRecorder
-from .retarget import clip_to_joint_ranges, compute_angles
 from .sim import G1Sim
 
 
+# ── Options dataclass ─────────────────────────────────────────────────────────
+
 @dataclass
 class RunOptions:
-    camera: int = config.CAMERA_INDEX
-    pose_only: bool = False
-    viewer: bool = False
+    camera: int           = config.CAMERA_INDEX
+    pose_only: bool       = False
+    viewer: bool          = False
     record_path: Path | None = None
-    duration: float = 0.0
-    mirror_display: bool = True
-    debug_print: bool = False
+    duration: float       = 0.0
+    mirror_display: bool  = True
+    debug_print: bool     = False
+    recalibrate: bool     = False
+    ik_debug: bool        = False
 
+
+# ── Camera helpers ────────────────────────────────────────────────────────────
 
 def _open_camera(idx: int) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  config.FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
     if not cap.isOpened():
-        raise RuntimeError(f"cannot open camera {idx}")
+        raise RuntimeError(f"Cannot open camera {idx}")
     return cap
 
 
-def _hud_text(angles: np.ndarray) -> list[str]:
-    return [
-        f"L pit={angles[0]:+.2f} rol={angles[1]:+.2f} yaw={angles[2]:+.2f} elb={angles[3]:+.2f}",
-        f"R pit={angles[4]:+.2f} rol={angles[5]:+.2f} yaw={angles[6]:+.2f} elb={angles[7]:+.2f}",
-    ]
+# ── HUD overlay ───────────────────────────────────────────────────────────────
+
+def _hud_text(targets: np.ndarray) -> list[str]:
+    """14-element target vector → 2 summary lines for the camera overlay."""
+    n = len(targets) // 2
+    L = targets[:n]
+    R = targets[n:]
+    fmt = lambda v: " ".join(f"{x:+.2f}" for x in v)
+    return [f"L: {fmt(L)}", f"R: {fmt(R)}"]
 
 
-def _annotate(frame: np.ndarray, lines: list[str], fps: float, mirror: bool) -> np.ndarray:
+def _annotate(
+    frame: np.ndarray,
+    lines: list[str],
+    fps: float,
+    mirror: bool,
+    calib: BodyCalibration | None,
+) -> np.ndarray:
     shown = cv2.flip(frame, 1) if mirror else frame.copy()
-    cv2.putText(shown, f"fps={fps:5.1f}  q=quit", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-    y = 50
+    cv2.putText(
+        shown, f"fps={fps:5.1f}  q=quit", (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA,
+    )
+    if calib is not None:
+        cv2.putText(
+            shown,
+            f"scale={calib.scale:.2f}  arm={calib.arm_length_user:.2f}m",
+            (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA,
+        )
+    y = 75
     for ln in lines:
-        cv2.putText(shown, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
-        y += 20
+        cv2.putText(
+            shown, ln, (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA,
+        )
+        y += 18
     return shown
 
 
-def run(opts: RunOptions) -> int:
-    cap = _open_camera(opts.camera)
+# ── Main run function ─────────────────────────────────────────────────────────
+
+def run(opts: RunOptions) -> int:  # noqa: C901
+    cap  = _open_camera(opts.camera)
     pose = PoseEstimator()
+
     sim: G1Sim | None = None
-    lm_smoother = LandmarkSmoother(alpha=config.LANDMARK_SMOOTH_ALPHA)
-    smoother = ExpSmoother(dim=8, alpha=config.SMOOTHING_ALPHA)
-    viewer = None
+    arm_ik: ArmIK | None = None
+    calib: BodyCalibration | None = None
+    viewer   = None
     renderer: mujoco.Renderer | None = None
     recorder: SplitScreenRecorder | None = None
+
+    # One-Euro filter for raw MediaPipe world landmarks (33 pts × 3 coords).
+    lm_filter = OneEuroFilterArray(shape=(33, 3))
 
     try:
         if not opts.pose_only:
             sim = G1Sim()
             n_substeps = sim.substeps_for_fps(config.TARGET_FPS)
+
+            # ── Calibration ──────────────────────────────────────────────────
+            if not opts.recalibrate:
+                calib = BodyCalibration.load(config.CALIBRATION_PATH)
+                if calib is not None:
+                    print(
+                        f"[calibration] loaded from cache — "
+                        f"scale={calib.scale:.3f}, "
+                        f"user_arm={calib.arm_length_user:.3f} m"
+                    )
+            if calib is None:
+                print("[calibration] running T-pose calibration…")
+                calib = run_calibration(
+                    cap, pose,
+                    arm_length_robot=sim.arm_length_robot,
+                )
+                calib.save()
+                print(
+                    f"[calibration] done — "
+                    f"scale={calib.scale:.3f}, "
+                    f"user_arm={calib.arm_length_user:.3f} m, "
+                    f"robot_arm={calib.arm_length_robot:.3f} m"
+                )
+
+            arm_ik = ArmIK(sim)
+
             if opts.viewer:
                 viewer = mujoco.viewer.launch_passive(sim.model, sim.data)
             if opts.record_path:
                 renderer = sim.make_renderer(config.FRAME_W, config.FRAME_H)
                 recorder = SplitScreenRecorder(
-                    opts.record_path, config.FRAME_W, config.FRAME_H, float(config.TARGET_FPS)
+                    opts.record_path,
+                    config.FRAME_W, config.FRAME_H,
+                    float(config.TARGET_FPS),
                 )
 
-        t0 = time.time()
-        next_t = t0
+        # ── Main loop ────────────────────────────────────────────────────────
+        t0        = time.time()
+        next_t    = t0
         frame_idx = 0
-        last_angles = np.zeros(8)
-        prev_smoothed = np.zeros(8)
+        last_targets = np.zeros(len(config.ARM_JOINT_NAMES))
+        dt = 1.0 / config.TARGET_FPS
 
         while True:
             ret, frame = cap.read()
@@ -100,26 +164,37 @@ def run(opts: RunOptions) -> int:
 
             res: PoseResult = pose.process(frame)
 
-            if not opts.pose_only and sim is not None:
+            if not opts.pose_only and sim is not None and arm_ik is not None and calib is not None:
                 if res.world_landmarks is not None:
-                    # 1. Pre-smooth landmark positions to stabilise the body frame.
-                    smooth_lm = lm_smoother.update(res.world_landmarks)
-                    # 2. Compute raw joint angles from smoothed landmarks.
-                    raw, valid = compute_angles(smooth_lm, res.visibility)
-                    # 3. EMA smooth the angles themselves.
-                    smoothed = smoother.update(raw, valid)
-                    # 4. Velocity-clamp: prevent per-frame jumps > MAX_ANGLE_DELTA_RAD.
-                    vel_clamped = limit_delta(prev_smoothed, smoothed, config.MAX_ANGLE_DELTA_RAD)
-                    prev_smoothed = vel_clamped.copy()
-                    clipped = clip_to_joint_ranges(vel_clamped, sim.joint_ranges)
-                    sim.set_arm_angles(clipped)
-                    last_angles = clipped
-                    if opts.debug_print and frame_idx % 30 == 0:
-                        print("angles:", " ".join(f"{v:+.2f}" for v in clipped))
+                    # Check that required landmarks are visible.
+                    vis = res.visibility
+                    arms_visible = (
+                        vis is not None
+                        and all(
+                            vis[i] >= config.VISIBILITY_THRESHOLD
+                            for i in (
+                                config.LM_LEFT_SHOULDER,  config.LM_RIGHT_SHOULDER,
+                                config.LM_LEFT_WRIST,     config.LM_RIGHT_WRIST,
+                            )
+                        )
+                    )
+                    if arms_visible:
+                        lms_smooth = lm_filter.update(res.world_landmarks, dt)
+                        targets = arm_ik.step(lms_smooth, calib, dt=dt)
+                        last_targets = targets
+                        if opts.ik_debug and frame_idx % 30 == 0:
+                            print("IK targets:", " ".join(f"{v:+.2f}" for v in targets))
+
                 sim.step(n_substeps=n_substeps)
 
             fps = (frame_idx + 1) / max(1e-6, time.time() - t0)
-            shown = _annotate(res.annotated, _hud_text(last_angles), fps, opts.mirror_display)
+            shown = _annotate(
+                res.annotated,
+                _hud_text(last_targets),
+                fps,
+                opts.mirror_display,
+                calib,
+            )
 
             if recorder is not None and renderer is not None and sim is not None:
                 renderer.update_scene(sim.data)
@@ -148,7 +223,7 @@ def run(opts: RunOptions) -> int:
             if next_t > now:
                 time.sleep(next_t - now)
             else:
-                next_t = now  # fell behind; reset
+                next_t = now
 
     finally:
         cap.release()
