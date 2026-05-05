@@ -143,6 +143,33 @@ class G1Sim:
         self.data.qpos[:7] = self._root_qpos
         self.data.qvel[:6] = 0.0
 
+    def step_smooth(
+        self,
+        n_substeps: int = 1,
+        ik_target: np.ndarray | None = None,
+        tau: float = 0.04,
+    ) -> None:
+        """Advance physics at real-time rate with per-substep ctrl interpolation.
+
+        Instead of writing ctrl once per MediaPipe frame (causing sudden jumps),
+        this exponentially smooths ctrl toward ik_target at each physics timestep.
+
+        tau: tracking time constant in seconds (0.04 = 40 ms). Smaller = faster
+             tracking but less smoothing. Larger = smoother but laggier.
+        """
+        if ik_target is not None:
+            alpha = float(1.0 - np.exp(-self.dt / tau))
+            tgt = np.asarray(ik_target, dtype=np.float64)
+            ids = self.actuator_ids
+        for _ in range(max(1, n_substeps)):
+            if ik_target is not None:
+                self.data.ctrl[ids] += alpha * (tgt - self.data.ctrl[ids])
+            self.data.qpos[:7] = self._root_qpos
+            self.data.qvel[:6] = 0.0
+            mujoco.mj_step(self.model, self.data)
+        self.data.qpos[:7] = self._root_qpos
+        self.data.qvel[:6] = 0.0
+
     def substeps_for_fps(self, fps: float) -> int:
         return max(1, int(round((1.0 / fps) / self.dt)))
 

@@ -112,7 +112,6 @@ def run(opts: RunOptions) -> int:  # noqa: C901
     try:
         if not opts.pose_only:
             sim = G1Sim()
-            n_substeps = sim.substeps_for_fps(config.TARGET_FPS)
 
             # ── Calibration ──────────────────────────────────────────────────
             if not opts.recalibrate:
@@ -153,8 +152,11 @@ def run(opts: RunOptions) -> int:  # noqa: C901
         t0        = time.time()
         next_t    = t0
         frame_idx = 0
-        last_targets = np.zeros(len(config.ARM_JOINT_NAMES))
-        dt = 1.0 / config.TARGET_FPS
+        last_targets = (
+            sim.data.ctrl[sim.actuator_ids].copy() if sim is not None else np.zeros(len(config.ARM_JOINT_NAMES))
+        )
+        _ik_valid = False
+        _t_prev   = time.time()
 
         while True:
             ret, frame = cap.read()
@@ -162,11 +164,14 @@ def run(opts: RunOptions) -> int:  # noqa: C901
                 print("Camera read failed; exiting.", file=sys.stderr)
                 break
 
+            _t_now = time.time()
+            dt = max(0.005, min(_t_now - _t_prev, 0.5))
+            _t_prev = _t_now
+
             res: PoseResult = pose.process(frame)
 
             if not opts.pose_only and sim is not None and arm_ik is not None and calib is not None:
                 if res.world_landmarks is not None:
-                    # Check that required landmarks are visible.
                     vis = res.visibility
                     arms_visible = (
                         vis is not None
@@ -182,10 +187,15 @@ def run(opts: RunOptions) -> int:  # noqa: C901
                         lms_smooth = lm_filter.update(res.world_landmarks, dt)
                         targets = arm_ik.step(lms_smooth, calib, dt=dt, visibility=res.visibility)
                         last_targets = targets
+                        _ik_valid = True
                         if opts.ik_debug and frame_idx % 30 == 0:
                             print("IK targets:", " ".join(f"{v:+.2f}" for v in targets))
 
-                sim.step(n_substeps=n_substeps)
+                n_substeps = max(1, round(dt / sim.dt))
+                sim.step_smooth(
+                    n_substeps=n_substeps,
+                    ik_target=last_targets if _ik_valid else None,
+                )
 
             fps = (frame_idx + 1) / max(1e-6, time.time() - t0)
             shown = _annotate(

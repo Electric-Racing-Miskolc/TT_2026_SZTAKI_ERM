@@ -79,7 +79,7 @@ def build_body_frame(lms: np.ndarray) -> np.ndarray:
     L_hip = lms[config.LM_LEFT_HIP]
     R_hip = lms[config.LM_RIGHT_HIP]
 
-    e_x = _normalize(L_sh - R_sh)
+    e_x = _normalize(L_hip - R_hip)   # hips are stable; shoulders tilt with arm motion
     e_z = _normalize(0.5 * (L_sh + R_sh) - 0.5 * (L_hip + R_hip))
     e_y = _normalize(np.cross(e_z, e_x))
     e_x = _normalize(np.cross(e_y, e_z))
@@ -259,9 +259,8 @@ class ArmIK:
             targets = limit_delta(self._prev_ctrl, targets, self._max_delta)
         self._prev_ctrl = targets.copy()
 
-        for i, aid in enumerate(self._act_ids):
-            self._data.ctrl[aid] = float(targets[i])
-
+        # ctrl is NOT written here; caller uses sim.step_smooth() to apply
+        # targets smoothly at the physics rate (avoids sudden ctrl jumps).
         return targets
 
     # ── Internal helpers ─────────────────────────────────────────────────────

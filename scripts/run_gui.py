@@ -199,14 +199,28 @@ class SimThread(threading.Thread):
 
             t0           = time.time()
             frame_idx    = 0
-            last_targets = np.zeros(len(config.ARM_JOINT_NAMES))
+            # Initialise ctrl targets from the current stand-pose ctrl values
+            # so step_smooth() starts from the correct resting position.
+            last_targets = sim.data.ctrl[sim.actuator_ids].copy()
+            _ik_valid    = False          # True once the first IK result arrives
+            _t_prev      = time.time()   # wall-clock time of previous frame
             _csv_file    = None
             _csv_writer  = None
 
             while not self._stop_evt.is_set():
-                s  = self.settings
-                dt = 1.0 / max(1, s.target_fps)
-                n_substeps = sim.substeps_for_fps(s.target_fps)
+                s = self.settings
+
+                # -- Actual elapsed time since previous frame --
+                _t_now   = time.time()
+                actual_dt = max(0.005, min(_t_now - _t_prev, 0.5))
+                _t_prev  = _t_now
+
+                # n_substeps computed from real elapsed time so physics runs
+                # at wall-clock speed regardless of MediaPipe latency.
+                n_substeps = max(1, round(actual_dt / sim.dt))
+
+                # dt for OEF filter = actual inter-frame interval
+                dt = actual_dt
 
                 # -- OEF ujraepitese ha megvaltoztak a parameterek --
                 cur_oef = (s.oef_min_cutoff, s.oef_beta)
@@ -312,6 +326,7 @@ class SimThread(threading.Thread):
                                 synth = lms_f
 
                             last_targets = arm_ik.step(synth, calib, dt=dt, visibility=res_f.visibility)
+                            _ik_valid = True
                         except Exception as exc:
                             self._log(f"IK lepes hiba: {exc}")
 
@@ -330,8 +345,11 @@ class SimThread(threading.Thread):
                         else:
                             self._log("Front: nincs lathatosagi adat (pose nem detektalt)")
 
-                # -- Fizika --
-                sim.step(n_substeps=n_substeps)
+                # -- Fizika: valós idejű step + per-substep ctrl simítás --
+                sim.step_smooth(
+                    n_substeps=n_substeps,
+                    ik_target=last_targets if _ik_valid else None,
+                )
 
                 # -- Render (throttled: csak minden _RENDER_EVERY-edik frame-ben) --
                 if frame_idx % _RENDER_EVERY == 0:
@@ -413,10 +431,11 @@ class SimThread(threading.Thread):
 
                 frame_idx += 1
 
-                # -- Wall-clock pacing --
-                elapsed  = time.time() - t0
-                expected = frame_idx * dt
-                sleep_t  = expected - elapsed
+                # -- Wall-clock pacing (fixed rate, independent of actual_dt) --
+                _dt_target = 1.0 / max(1, s.target_fps)
+                elapsed    = time.time() - t0
+                expected   = frame_idx * _dt_target
+                sleep_t    = expected - elapsed
                 if sleep_t > 0:
                     time.sleep(sleep_t)
 

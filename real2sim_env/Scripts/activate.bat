@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set VIRTUAL_ENV=C:\Users\Lenovo T490\Documents\GitHub\TT_2026_SZTAKI_ERM\real2sim_env
+set VIRTUAL_ENV=C:\Users\ladid\Dokumentumok\Adam\GitHub\TT_2026_SZTAKI_ERM\real2sim_env
 
 if not defined PROMPT set PROMPT=$P$G
 
