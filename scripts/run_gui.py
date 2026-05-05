@@ -991,6 +991,7 @@ class Real2SimGUI:
             f"[{time.strftime('%H:%M:%S')}] Mode valtas -> "
             f"{MODE_LABELS.get(new_mode, new_mode)}"
         )
+        self._apply_settings_to_struct()   # settings.mode frissitese az uj modra
         if self._running:
             self._log_append(
                 f"[{time.strftime('%H:%M:%S')}] Szal ujrainditasa az uj moddal..."
