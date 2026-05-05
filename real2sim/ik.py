@@ -53,6 +53,7 @@ except ImportError as e:
 
 from . import config
 from .calibration import BodyCalibration
+from .filter import limit_delta
 from .sim import G1Sim, _load_patched_model
 
 EPS = 1e-6
@@ -127,6 +128,25 @@ class ArmIK:
         self._limits = [mink.ConfigurationLimit(_ik_model)]
         self._tasks  = [self._left_task, self._right_task, self._posture_task]
 
+        # ── Elbow FrameTasks (added dynamically in step() based on visibility) ─
+        self._left_elbow_task = mink.FrameTask(
+            frame_name="left_elbow_link",
+            frame_type="body",
+            position_cost=0.5,
+            orientation_cost=0.0,
+        )
+        self._right_elbow_task = mink.FrameTask(
+            frame_name="right_elbow_link",
+            frame_type="body",
+            position_cost=0.5,
+            orientation_cost=0.0,
+        )
+
+        # Rate-limiter state: prevents sudden joint-angle jumps when MediaPipe
+        # briefly loses tracking (e.g. hands near face).
+        self._prev_ctrl: np.ndarray | None = None
+        self._max_delta = 0.12  # rad/frame max change (~3.6 rad/s at 30 fps)
+
         # ── Fixed geometry from IK model (consistent with IK frame) ──────────
         self._left_sh_xpos  = _ik_data.body("left_shoulder_pitch_link").xpos.copy()
         self._right_sh_xpos = _ik_data.body("right_shoulder_pitch_link").xpos.copy()
@@ -149,9 +169,10 @@ class ArmIK:
 
     def step(
         self,
-        lms_filtered: np.ndarray,   # (33, 3) One-Euro filtered world landmarks
+        lms_filtered: np.ndarray,          # (33, 3) One-Euro filtered world landmarks
         calib: BodyCalibration,
         dt: float = config.IK_DT,
+        visibility: np.ndarray | None = None,  # (33,) MediaPipe visibility scores
     ) -> np.ndarray:
         """Solve IK for one timestep.
 
@@ -174,6 +195,27 @@ class ArmIK:
         self._left_task.set_target(mink.SE3.from_translation(left_target))
         self._right_task.set_target(mink.SE3.from_translation(right_target))
 
+        # ── Elbow tasks: only when elbow is visible ───────────────────────────
+        tasks = list(self._tasks)
+        thr = config.VISIBILITY_THRESHOLD
+        if visibility is not None:
+            if visibility[config.LM_LEFT_ELBOW] >= thr:
+                el_tgt = self._wrist_target(
+                    lms_filtered[config.LM_LEFT_SHOULDER],
+                    lms_filtered[config.LM_LEFT_ELBOW],
+                    R_body, calib, self._left_sh_xpos,
+                )
+                self._left_elbow_task.set_target(mink.SE3.from_translation(el_tgt))
+                tasks.append(self._left_elbow_task)
+            if visibility[config.LM_RIGHT_ELBOW] >= thr:
+                el_tgt = self._wrist_target(
+                    lms_filtered[config.LM_RIGHT_SHOULDER],
+                    lms_filtered[config.LM_RIGHT_ELBOW],
+                    R_body, calib, self._right_sh_xpos,
+                )
+                self._right_elbow_task.set_target(mink.SE3.from_translation(el_tgt))
+                tasks.append(self._right_elbow_task)
+
         # Sync ALL joints (leg + waist + arm) from physics into fixed-base cfg.
         # physics qpos[7:] maps 1-to-1 to fixed-base qpos[:].
         self._cfg.update(self._data.qpos[self._phys_qpos_slice].copy())
@@ -181,7 +223,7 @@ class ArmIK:
         try:
             vel = mink.solve_ik(
                 self._cfg,
-                self._tasks,
+                tasks,
                 dt=dt,
                 solver=config.IK_SOLVER,
                 limits=self._limits,
@@ -194,7 +236,14 @@ class ArmIK:
         self._cfg.integrate_inplace(vel, dt)
 
         # Write solved arm qpos as ctrl targets for the PD actuators.
-        targets = self._cfg.q[self._qpos_adr]
+        targets = self._cfg.q[self._qpos_adr].copy()
+
+        # Rate-limit: clamp per-joint delta to avoid sudden jumps when
+        # MediaPipe re-acquires landmarks after brief occlusion.
+        if self._prev_ctrl is not None:
+            targets = limit_delta(self._prev_ctrl, targets, self._max_delta)
+        self._prev_ctrl = targets.copy()
+
         for i, aid in enumerate(self._act_ids):
             self._data.ctrl[aid] = float(targets[i])
 

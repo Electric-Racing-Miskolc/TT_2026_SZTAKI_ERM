@@ -180,7 +180,7 @@ def run(opts: RunOptions) -> int:  # noqa: C901
                     )
                     if arms_visible:
                         lms_smooth = lm_filter.update(res.world_landmarks, dt)
-                        targets = arm_ik.step(lms_smooth, calib, dt=dt)
+                        targets = arm_ik.step(lms_smooth, calib, dt=dt, visibility=res.visibility)
                         last_targets = targets
                         if opts.ik_debug and frame_idx % 30 == 0:
                             print("IK targets:", " ".join(f"{v:+.2f}" for v in targets))

@@ -163,7 +163,7 @@ class SimThread(threading.Thread):
             # -- Szimulacios modell --
             self._log("G1 MuJoCo modell betoltese...")
             sim      = G1Sim()
-            renderer = sim.make_renderer(config.FRAME_W, config.FRAME_H)
+            renderer = sim.make_renderer(_RENDER_W, _RENDER_H)
             self._log(f"G1 betoltve -- robot kar: {sim.arm_length_robot:.3f} m")
 
             # -- Kalibraciot betoltese cache-bol --
@@ -187,7 +187,12 @@ class SimThread(threading.Thread):
             prev_posture_cost = self.settings.ik_posture_cost
 
             # Fusion mode allapot: utolso jol meresett rel_body[1] freezehez
-            last_y_state = {"left": 0.0, "right": 0.0}
+            # Kulcsok: "left_wrist", "right_wrist", "left_elbow", "right_elbow"
+            last_y_state = {
+                "left_wrist":  0.0, "right_wrist":  0.0,
+                "left_elbow":  0.0, "right_elbow":  0.0,
+            }
+            _cached_sim_pixels = None
             self._log("Keszen all.")
 
             t0           = time.time()
@@ -302,7 +307,7 @@ class SimThread(threading.Thread):
                             else:
                                 synth = lms_f
 
-                            last_targets = arm_ik.step(synth, calib, dt=dt)
+                            last_targets = arm_ik.step(synth, calib, dt=dt, visibility=res_f.visibility)
                         except Exception as exc:
                             self._log(f"IK lepes hiba: {exc}")
 
@@ -324,9 +329,11 @@ class SimThread(threading.Thread):
                 # -- Fizika --
                 sim.step(n_substeps=n_substeps)
 
-                # -- Render --
-                renderer.update_scene(sim.data)
-                sim_pixels = renderer.render()
+                # -- Render (throttled: csak minden _RENDER_EVERY-edik frame-ben) --
+                if frame_idx % _RENDER_EVERY == 0:
+                    renderer.update_scene(sim.data)
+                    _cached_sim_pixels = renderer.render()
+                sim_pixels = _cached_sim_pixels
 
                 cam_show = (
                     cv2.flip(res_f.annotated, 1) if self.mirror
@@ -395,6 +402,12 @@ TEXT    = "#cdd6f4"
 SUBTEXT = "#6c7086"
 
 POLL_MS = 33   # ~30 Hz GUI frissites
+
+# Offscreen renderer beallitasok a GUI-ban: kisebb felbontas + ritkabb render
+# hogy ne az OpenGL legyen a szuk keresztmetszet (4 fps -> ~20 fps)
+_RENDER_W     = 320
+_RENDER_H     = 240
+_RENDER_EVERY = 3   # minden 3. frame-ben renderel (display ~10 fps, fizika 30 fps)
 
 
 # =============================================================================

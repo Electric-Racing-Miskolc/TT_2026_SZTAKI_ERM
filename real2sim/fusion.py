@@ -37,10 +37,10 @@ MODE_LABELS = {
     MODE_FUSION: "2 kamera (fuzio)",
 }
 
-# (oldal, shoulder_idx, wrist_idx) parok
+# (oldal, shoulder_idx, wrist_idx, elbow_idx) parok
 _ARM_PAIRS = (
-    ("left",  config.LM_LEFT_SHOULDER,  config.LM_LEFT_WRIST),
-    ("right", config.LM_RIGHT_SHOULDER, config.LM_RIGHT_WRIST),
+    ("left",  config.LM_LEFT_SHOULDER,  config.LM_LEFT_WRIST,  config.LM_LEFT_ELBOW),
+    ("right", config.LM_RIGHT_SHOULDER, config.LM_RIGHT_WRIST, config.LM_RIGHT_ELBOW),
 )
 
 
@@ -63,10 +63,11 @@ def make_2d_landmarks(lms_front: np.ndarray) -> np.ndarray:
     """
     R   = build_body_frame(lms_front)
     out = lms_front.copy()
-    for _arm, sh_idx, wr_idx in _ARM_PAIRS:
-        rel = R.T @ (lms_front[wr_idx] - lms_front[sh_idx])
-        rel[1] = 0.0                                # forward/back nullazas
-        out[wr_idx] = lms_front[sh_idx] + R @ rel
+    for _arm, sh_idx, wr_idx, el_idx in _ARM_PAIRS:
+        for lm_idx in (el_idx, wr_idx):
+            rel = R.T @ (lms_front[lm_idx] - lms_front[sh_idx])
+            rel[1] = 0.0                            # forward/back nullazas
+            out[lm_idx] = lms_front[sh_idx] + R @ rel
     return out
 
 
@@ -95,8 +96,8 @@ def fuse_dual_landmarks(
     lms_side : (33, 3) float array vagy None
         Side kamera szuretelt world landmarks (None ha nincs detektalva).
     last_y_state : dict[str, float]
-        Szal-elettartamu allapot {'left': float, 'right': float}; a fuggveny
-        in-place frissiti, ha side_ok=True.
+        Szal-elettartamu allapot {'left_wrist', 'right_wrist', 'left_elbow',
+        'right_elbow'}; a fuggveny in-place frissiti, ha side_ok=True.
     side_ok : bool
         True, ha a side kamera erveny0 detekciot adott; False eseten freeze.
 
@@ -111,21 +112,17 @@ def fuse_dual_landmarks(
         if (side_ok and lms_side is not None) else None
     )
 
-    for arm, sh_idx, wr_idx in _ARM_PAIRS:
-        # Front kamera rel_body
-        rel_f = R_front.T @ (lms_front[wr_idx] - lms_front[sh_idx])
+    for arm, sh_idx, wr_idx, el_idx in _ARM_PAIRS:
+        for lm_idx, state_key in ((wr_idx, arm + "_wrist"), (el_idx, arm + "_elbow")):
+            rel_f = R_front.T @ (lms_front[lm_idx] - lms_front[sh_idx])
 
-        # Side kamera rel_body (vagy utolso jo ertek)
-        if side_ok and R_side is not None and lms_side is not None:
-            rel_s = R_side.T @ (lms_side[wr_idx] - lms_side[sh_idx])
-            last_y_state[arm] = float(rel_s[1])
-        rel_y = last_y_state.get(arm, 0.0)
+            if side_ok and R_side is not None and lms_side is not None:
+                rel_s = R_side.T @ (lms_side[lm_idx] - lms_side[sh_idx])
+                last_y_state[state_key] = float(rel_s[1])
+            rel_y = last_y_state.get(state_key, 0.0)
 
-        # Fuzio: [front_X, side_Y, front_Z]
-        rel_fused = np.array([rel_f[0], rel_y, rel_f[2]], dtype=np.float64)
-
-        # Vissza a kamera-koordinatakba a front body-frame-en keresztul
-        out[wr_idx] = lms_front[sh_idx] + R_front @ rel_fused
+            rel_fused = np.array([rel_f[0], rel_y, rel_f[2]], dtype=np.float64)
+            out[lm_idx] = lms_front[sh_idx] + R_front @ rel_fused
 
     return out
 
