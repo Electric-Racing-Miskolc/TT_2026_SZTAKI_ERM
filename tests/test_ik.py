@@ -137,7 +137,7 @@ def test_ik_palm_site_error(sim_and_ik):
     right_sh = ik_data.body("right_shoulder_pitch_link").xpos.copy()
     torso_xmat = ik_data.body("torso_link").xmat.reshape(3, 3)
     R_mp_to_world = np.column_stack([
-        torso_xmat[:, 1], torso_xmat[:, 0], torso_xmat[:, 2]
+        torso_xmat[:, 1], -torso_xmat[:, 0], torso_xmat[:, 2]
     ])
     R_body = build_body_frame(lms.astype(np.float64))
 

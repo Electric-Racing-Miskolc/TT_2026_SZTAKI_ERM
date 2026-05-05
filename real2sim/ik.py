@@ -133,9 +133,9 @@ class ArmIK:
 
         torso_xmat = _ik_data.body("torso_link").xmat.reshape(3, 3)
         self._R_mp_to_world = np.column_stack([
-            torso_xmat[:, 1],  # mp_x (person left)    → robot left    (+Y)
-            torso_xmat[:, 0],  # mp_y (person forward)  → robot forward (+X)
-            torso_xmat[:, 2],  # mp_z (person up)        → robot up     (+Z)
+            torso_xmat[:, 1],   # mp_x (person left)    → robot left    (+Y)
+            -torso_xmat[:, 0],  # mp_y (person forward)  → robot forward (+X)  [negated: MediaPipe body-frame e_y points toward camera, so rel_body[1] is negative for forward motion]
+            torso_xmat[:, 2],   # mp_z (person up)        → robot up     (+Z)
         ])
 
         # ── Actuator / qpos address mapping ──────────────────────────────────
@@ -186,7 +186,9 @@ class ArmIK:
                 solver=config.IK_SOLVER,
                 limits=self._limits,
             )
-        except Exception:
+        except Exception as _ik_exc:
+            import traceback as _tb
+            print(f"[IK] solve_ik failed: {_ik_exc}\n{_tb.format_exc()}", flush=True)
             return self._data.ctrl[self._act_ids].copy()
 
         self._cfg.integrate_inplace(vel, dt)

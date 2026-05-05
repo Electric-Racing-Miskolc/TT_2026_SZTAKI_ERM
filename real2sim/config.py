@@ -60,7 +60,7 @@ OEF_BETA       = 0.05  # Speed coupling (higher → less lag on fast motion)
 OEF_D_CUTOFF   = 1.0   # Hz — derivative cutoff
 
 # ── Camera / recording ───────────────────────────────────────────────────────
-CAMERA_INDEX = 0
+CAMERA_INDEX = 2   # 0 = beépített RGB, 1 = IR (Windows Hello), 2 = USB kamera
 FRAME_W      = 640
 FRAME_H      = 480
 TARGET_FPS   = 30

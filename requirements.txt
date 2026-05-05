@@ -5,3 +5,4 @@ mediapipe
 pytest
 mink
 daqp
+Pillow
