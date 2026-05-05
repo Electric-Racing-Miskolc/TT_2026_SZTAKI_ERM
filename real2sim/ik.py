@@ -147,6 +147,9 @@ class ArmIK:
         self._prev_ctrl: np.ndarray | None = None
         self._max_delta = 0.12  # rad/frame max change (~3.6 rad/s at 30 fps)
 
+        # Debug info populated every step(), readable by GUI/logging code.
+        self.last_debug: dict = {}
+
         # ── Fixed geometry from IK model (consistent with IK frame) ──────────
         self._left_sh_xpos  = _ik_data.body("left_shoulder_pitch_link").xpos.copy()
         self._right_sh_xpos = _ik_data.body("right_shoulder_pitch_link").xpos.copy()
@@ -194,6 +197,18 @@ class ArmIK:
 
         self._left_task.set_target(mink.SE3.from_translation(left_target))
         self._right_task.set_target(mink.SE3.from_translation(right_target))
+
+        # Debug info: rel_body = wrist position in person body-frame (meters).
+        # In B-mode the Y component (forward/back) should be ~0.
+        # L/R_tgt_x = robot forward position of the wrist target (constant in B-mode).
+        self.last_debug = {
+            "L_body": (R_body.T @ (lms_filtered[config.LM_LEFT_WRIST]  - lms_filtered[config.LM_LEFT_SHOULDER])).tolist(),
+            "R_body": (R_body.T @ (lms_filtered[config.LM_RIGHT_WRIST] - lms_filtered[config.LM_RIGHT_SHOULDER])).tolist(),
+            "L_tgt_x": float(left_target[0]),
+            "R_tgt_x": float(right_target[0]),
+            "L_tgt":   left_target.tolist(),
+            "R_tgt":   right_target.tolist(),
+        }
 
         # ── Elbow tasks: only when elbow is visible ───────────────────────────
         tasks = list(self._tasks)

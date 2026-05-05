@@ -61,6 +61,7 @@ class SimFrame:
     calib:        Optional[BodyCalibration]
     status:       str
     cam_side_bgr: Optional[np.ndarray] = None   # csak Mode C-ben
+    debug_info:   Optional[dict]        = None   # debug adatok
 
 
 @dataclass
@@ -71,6 +72,7 @@ class SimSettings:
     visibility_thresh:   float = config.VISIBILITY_THRESHOLD
     ik_posture_cost:     float = config.IK_POSTURE_COST
     target_fps:          int   = config.TARGET_FPS
+    debug_mode:          bool  = False
     # Mode + kamerak
     mode:                str   = MODE_3D
     side_camera_idx:     int   = 0           # csak Mode C-ben hasznalt
@@ -163,7 +165,7 @@ class SimThread(threading.Thread):
             # -- Szimulacios modell --
             self._log("G1 MuJoCo modell betoltese...")
             sim      = G1Sim()
-            renderer = sim.make_renderer(_RENDER_W, _RENDER_H)
+            renderer = sim.make_renderer(config.FRAME_W, config.FRAME_H)
             self._log(f"G1 betoltve -- robot kar: {sim.arm_length_robot:.3f} m")
 
             # -- Kalibraciot betoltese cache-bol --
@@ -198,6 +200,8 @@ class SimThread(threading.Thread):
             t0           = time.time()
             frame_idx    = 0
             last_targets = np.zeros(len(config.ARM_JOINT_NAMES))
+            _csv_file    = None
+            _csv_writer  = None
 
             while not self._stop_evt.is_set():
                 s  = self.settings
@@ -341,6 +345,54 @@ class SimThread(threading.Thread):
                 )
 
                 fps = (frame_idx + 1) / max(1e-6, time.time() - t0)
+                dbg = arm_ik.last_debug if arm_ik.last_debug else None
+
+                # -- Debug overlay + CSV logging --
+                if s.debug_mode and dbg:
+                    import csv as _csv
+                    from pathlib import Path as _Path
+
+                    # CSV megnyitasa (ha meg nincs)
+                    if _csv_file is None:
+                        _csv_path = _Path(__file__).resolve().parent.parent / "debug_log.csv"
+                        _csv_file = open(_csv_path, "w", newline="", encoding="utf-8")
+                        _csv_writer = _csv.writer(_csv_file)
+                        _csv_writer.writerow([
+                            "frame", "t", "mode", "fps",
+                            "L_body_x", "L_body_y", "L_body_z",
+                            "R_body_x", "R_body_y", "R_body_z",
+                            "L_tgt_x",  "R_tgt_x",
+                        ])
+                        self._log(f"Debug CSV: {_csv_path}")
+
+                    Lb = dbg["L_body"]
+                    Rb = dbg["R_body"]
+                    _csv_writer.writerow([
+                        frame_idx, f"{time.time()-t0:.3f}", mode, f"{fps:.1f}",
+                        f"{Lb[0]:.4f}", f"{Lb[1]:.4f}", f"{Lb[2]:.4f}",
+                        f"{Rb[0]:.4f}", f"{Rb[1]:.4f}", f"{Rb[2]:.4f}",
+                        f"{dbg['L_tgt_x']:.4f}", f"{dbg['R_tgt_x']:.4f}",
+                    ])
+                    if frame_idx % 10 == 0:
+                        _csv_file.flush()
+
+                    # Kamera kep overlay
+                    oy = cam_show.shape[0] - 10
+                    for txt, col in [
+                        (f"MODE: {mode}  FPS:{fps:.1f}", (200, 200, 50)),
+                        (f"L body  x={Lb[0]:+.3f}  y={Lb[1]:+.3f}  z={Lb[2]:+.3f}", (100, 220, 100)),
+                        (f"R body  x={Rb[0]:+.3f}  y={Rb[1]:+.3f}  z={Rb[2]:+.3f}", (100, 180, 255)),
+                        (f"L tgt_X={dbg['L_tgt_x']:+.3f}  R tgt_X={dbg['R_tgt_x']:+.3f}", (220, 180, 100)),
+                    ]:
+                        oy -= 20
+                        cv2.putText(cam_show, txt, (6, oy),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+
+                elif not s.debug_mode and _csv_file is not None:
+                    _csv_file.close()
+                    _csv_file   = None
+                    _csv_writer = None
+                    self._log("Debug CSV lezarva.")
 
                 sf = SimFrame(
                     cam_bgr      = cam_show,
@@ -350,6 +402,7 @@ class SimThread(threading.Thread):
                     calib        = calib,
                     status       = "Fut" if calib else "Kalibralatlan",
                     cam_side_bgr = cam_side_show,
+                    debug_info   = dbg,
                 )
                 # Csak a legfrissebb frame-t tartjuk
                 try:
@@ -372,6 +425,11 @@ class SimThread(threading.Thread):
             self.error = traceback.format_exc()
             self._log(f"FATALIS HIBA: {exc}")
         finally:
+            if _csv_file is not None:
+                try:
+                    _csv_file.close()
+                except Exception:
+                    pass
             for cap in (cap_front, cap_side):
                 try:
                     if cap is not None:
@@ -403,11 +461,8 @@ SUBTEXT = "#6c7086"
 
 POLL_MS = 33   # ~30 Hz GUI frissites
 
-# Offscreen renderer beallitasok a GUI-ban: kisebb felbontas + ritkabb render
-# hogy ne az OpenGL legyen a szuk keresztmetszet (4 fps -> ~20 fps)
-_RENDER_W     = 320
-_RENDER_H     = 240
-_RENDER_EVERY = 3   # minden 3. frame-ben renderel (display ~10 fps, fizika 30 fps)
+# Offscreen renderer: eredeti felbontas, de csak minden 3. frame-ben renderel
+_RENDER_EVERY = 3   # display ~10 fps, fizika 30 fps
 
 
 # =============================================================================
@@ -494,6 +549,7 @@ class Real2SimGUI:
         self._s_vis_thresh  = tk.DoubleVar(value=self._settings.visibility_thresh)
         self._s_ik_posture  = tk.DoubleVar(value=self._settings.ik_posture_cost)
         self._s_fps         = tk.IntVar(value=self._settings.target_fps)
+        self._s_debug       = tk.BooleanVar(value=False)
 
         self._frame_q: queue.Queue[SimFrame] = queue.Queue(maxsize=1)
         self._log_q:   queue.Queue[str]      = queue.Queue()
@@ -771,6 +827,22 @@ class Real2SimGUI:
                                   sticky="w", padx=4, pady=(0, 6))
         row += 1
 
+        # ---- Debug mod ----
+        tk.Label(sf, text="-- Debug mod --",
+                 bg=BG2, fg=ACCENT, font=("Segoe UI", 8, "bold"),
+                 anchor="w").grid(row=row, column=0, columnspan=3,
+                                  sticky="w", padx=4, pady=(4, 2))
+        row += 1
+        tk.Checkbutton(
+            sf, text="Debug overlay + CSV log (debug_log.csv)",
+            variable=self._s_debug,
+            bg=BG2, fg=TEXT, selectcolor=BG3,
+            activebackground=BG2, activeforeground=ACCENT,
+            font=("Segoe UI", 8),
+            command=self._on_apply_settings,
+        ).grid(row=row, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 6))
+        row += 1
+
         # Alkalmaz gomb
         _btn(
             sf, "Beallitasok alkalmazasa", BG3, ACCENT,
@@ -1042,6 +1114,7 @@ class Real2SimGUI:
         self._settings.target_fps        = int(self._s_fps.get())
         self._settings.mode              = self._mode_var.get()
         self._settings.side_camera_idx   = int(self._side_cam_idx.get())
+        self._settings.debug_mode        = bool(self._s_debug.get())
 
     def _on_apply_settings(self) -> None:
         self._apply_settings_to_struct()
