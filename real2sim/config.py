@@ -45,7 +45,7 @@ VISIBILITY_THRESHOLD = 0.5
 
 # ── IK solver ────────────────────────────────────────────────────────────────
 IK_SOLVER       = "daqp"       # CPU-friendly QP solver
-IK_POSTURE_COST = 1e-3         # Regularisation; keep arms near natural rest
+IK_POSTURE_COST = 0.1         # Regularisation; keep arms near natural rest, edited to make the joints stiffer
 IK_DT           = 1.0 / 30.0  # Integration step (matches TARGET_FPS)
 
 # ── Calibration ──────────────────────────────────────────────────────────────
@@ -55,8 +55,8 @@ CALIB_SCALE_MIN   = 0.4   # Safety clamp: robot / person arm-length ratio
 CALIB_SCALE_MAX   = 1.8
 
 # ── One-Euro filter (applied to raw MediaPipe world landmarks) ───────────────
-OEF_MIN_CUTOFF = 1.0   # Hz — base smoothing
-OEF_BETA       = 0.05  # Speed coupling (higher → less lag on fast motion)
+OEF_MIN_CUTOFF = 1.0   # Hz — base smoothing #ha nagy a késés még ezt növelhetjük
+OEF_BETA       = 0.01  # Speed coupling (higher → less lag on fast motion) ##0.05-ről változtatva, lassabb de stabilabb követés
 OEF_D_CUTOFF   = 1.0   # Hz — derivative cutoff
 
 # ── Camera / recording ───────────────────────────────────────────────────────

@@ -94,6 +94,14 @@ class ArmIK:
     def __init__(self, sim: G1Sim) -> None:
         self._model = sim.model   # full physics model
         self._data  = sim.data
+        
+        #csukló-összevisszára megoldás próbálkozás
+        # Szűkítsd le a csukló ízületek mozgástartományát majdnem nullára:
+        for joint_name in ["left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint"]:
+            j_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            # Az ízületi határok lekérése és fixálása az aktuális pozícióra
+            adr = self._model.jnt_qposadr[j_id]
+            self._model.jnt_range[j_id] = [self._data.qpos[adr], self._data.qpos[adr]]
 
         # ── Fixed-base IK model (no freejoint → base welded to world) ────────
         _ik_model = _load_patched_model(config.MODEL_PATH, fix_base=True)
