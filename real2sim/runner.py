@@ -1,4 +1,4 @@
-"""Main loop: webcam → MediaPipe → One-Euro filter → mink IK → MuJoCo.
+"""Main loop: webcam → MediaPipe → One-Euro filter → retarget → MuJoCo.
 
 Modes
 -----
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -21,10 +21,10 @@ import numpy as np
 
 from . import config
 from .calibration import BodyCalibration, run_calibration
-from .ik import ArmIK
 from .one_euro import OneEuroFilterArray
 from .pose import PoseEstimator, PoseResult
 from .recorder import SplitScreenRecorder
+from .retarget import compute_arm_angles
 from .sim import G1Sim
 
 
@@ -40,7 +40,7 @@ class RunOptions:
     mirror_display: bool  = True
     debug_print: bool     = False
     recalibrate: bool     = False
-    ik_debug: bool        = False
+    angle_debug: bool     = False
 
 
 # ── Camera helpers ────────────────────────────────────────────────────────────
@@ -61,7 +61,7 @@ def _hud_text(targets: np.ndarray) -> list[str]:
     n = len(targets) // 2
     L = targets[:n]
     R = targets[n:]
-    fmt = lambda v: " ".join(f"{x:+.2f}" for x in v)
+    fmt = lambda v: " ".join(f"{x:+.2f}" for x in v[:4])  # pitch/roll/yaw/elbow
     return [f"L: {fmt(L)}", f"R: {fmt(R)}"]
 
 
@@ -93,6 +93,20 @@ def _annotate(
     return shown
 
 
+# ── Visibility check helper ──────────────────────────────────────────────────
+
+def _arms_visible(vis: np.ndarray | None, threshold: float) -> bool:
+    if vis is None:
+        return False
+    required = (
+        config.LM_LEFT_SHOULDER,  config.LM_RIGHT_SHOULDER,
+        config.LM_LEFT_ELBOW,     config.LM_RIGHT_ELBOW,
+        config.LM_LEFT_WRIST,     config.LM_RIGHT_WRIST,
+        config.LM_LEFT_HIP,       config.LM_RIGHT_HIP,
+    )
+    return all(vis[i] >= threshold for i in required)
+
+
 # ── Main run function ─────────────────────────────────────────────────────────
 
 def run(opts: RunOptions) -> int:  # noqa: C901
@@ -100,13 +114,12 @@ def run(opts: RunOptions) -> int:  # noqa: C901
     pose = PoseEstimator()
 
     sim: G1Sim | None = None
-    arm_ik: ArmIK | None = None
     calib: BodyCalibration | None = None
+    anatomical_zero: np.ndarray | None = None
     viewer   = None
     renderer: mujoco.Renderer | None = None
     recorder: SplitScreenRecorder | None = None
 
-    # One-Euro filter for raw MediaPipe world landmarks (33 pts × 3 coords).
     lm_filter = OneEuroFilterArray(shape=(33, 3))
 
     try:
@@ -123,7 +136,7 @@ def run(opts: RunOptions) -> int:  # noqa: C901
                         f"user_arm={calib.arm_length_user:.3f} m"
                     )
             if calib is None:
-                print("[calibration] running T-pose calibration…")
+                print("[calibration] running 3-pose anthropometric calibration…")
                 calib = run_calibration(
                     cap, pose,
                     arm_length_robot=sim.arm_length_robot,
@@ -133,10 +146,10 @@ def run(opts: RunOptions) -> int:  # noqa: C901
                     f"[calibration] done — "
                     f"scale={calib.scale:.3f}, "
                     f"user_arm={calib.arm_length_user:.3f} m, "
-                    f"robot_arm={calib.arm_length_robot:.3f} m"
+                    f"shoulder_w={calib.shoulder_width_user:.3f} m, "
+                    f"torso_h={calib.torso_height_user:.3f} m"
                 )
-
-            arm_ik = ArmIK(sim)
+            anatomical_zero = np.asarray(calib.anatomical_zero, dtype=np.float64)
 
             if opts.viewer:
                 viewer = mujoco.viewer.launch_passive(sim.model, sim.data)
@@ -153,10 +166,11 @@ def run(opts: RunOptions) -> int:  # noqa: C901
         next_t    = t0
         frame_idx = 0
         last_targets = (
-            sim.data.ctrl[sim.actuator_ids].copy() if sim is not None else np.zeros(len(config.ARM_JOINT_NAMES))
+            sim.data.ctrl[sim.actuator_ids].copy() if sim is not None
+            else np.zeros(len(config.ARM_JOINT_NAMES))
         )
-        _ik_valid = False
-        _t_prev   = time.time()
+        _targets_valid = False
+        _t_prev = time.time()
 
         while True:
             ret, frame = cap.read()
@@ -170,31 +184,22 @@ def run(opts: RunOptions) -> int:  # noqa: C901
 
             res: PoseResult = pose.process(frame)
 
-            if not opts.pose_only and sim is not None and arm_ik is not None and calib is not None:
-                if res.world_landmarks is not None:
-                    vis = res.visibility
-                    arms_visible = (
-                        vis is not None
-                        and all(
-                            vis[i] >= config.VISIBILITY_THRESHOLD
-                            for i in (
-                                config.LM_LEFT_SHOULDER,  config.LM_RIGHT_SHOULDER,
-                                config.LM_LEFT_WRIST,     config.LM_RIGHT_WRIST,
-                            )
-                        )
+            if not opts.pose_only and sim is not None:
+                if res.world_landmarks is not None and _arms_visible(
+                    res.visibility, config.VISIBILITY_THRESHOLD,
+                ):
+                    lms_smooth = lm_filter.update(res.world_landmarks, dt)
+                    last_targets = compute_arm_angles(
+                        lms_smooth, anatomical_zero=anatomical_zero,
                     )
-                    if arms_visible:
-                        lms_smooth = lm_filter.update(res.world_landmarks, dt)
-                        targets = arm_ik.step(lms_smooth, calib, dt=dt, visibility=res.visibility)
-                        last_targets = targets
-                        _ik_valid = True
-                        if opts.ik_debug and frame_idx % 30 == 0:
-                            print("IK targets:", " ".join(f"{v:+.2f}" for v in targets))
+                    _targets_valid = True
+                    if opts.angle_debug and frame_idx % 30 == 0:
+                        print("targets:", " ".join(f"{v:+.2f}" for v in last_targets))
 
                 n_substeps = max(1, round(dt / sim.dt))
                 sim.step_smooth(
                     n_substeps=n_substeps,
-                    ik_target=last_targets if _ik_valid else None,
+                    ik_target=last_targets if _targets_valid else None,
                 )
 
             fps = (frame_idx + 1) / max(1e-6, time.time() - t0)
@@ -214,14 +219,9 @@ def run(opts: RunOptions) -> int:  # noqa: C901
             if viewer is not None:
                 viewer.sync()
 
-            if not opts.record_path or opts.viewer:
-                cv2.imshow("Real2Sim", shown)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-            else:
-                cv2.imshow("Real2Sim (recording)", shown)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+            cv2.imshow("Real2Sim", shown)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
             frame_idx += 1
             if opts.duration > 0 and time.time() - t0 >= opts.duration:

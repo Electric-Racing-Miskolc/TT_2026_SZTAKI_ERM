@@ -1,15 +1,15 @@
-"""Real2Sim -- tkinter GUI
+"""Real2Sim -- tkinter GUI (analytical retargeting edition).
 
 Layout:
-  TOP    : kamera preview  |  szimulacios preview  (nagy, nyujthato)
-  KOZEP  : Start/Stop/Kalibr. / kamera valaszto / tukrozes
-  BALRA  : Beallitasok (csuszkok: smoothness, IK, lathatosagi kuszob)
-  JOBBRA : Izuleti szogek + gorgethet log
+  TOP    : camera preview  |  simulation preview (large, resizable)
+  MID    : Start/Stop/Calibrate / camera selector / mirror toggle
+  LEFT   : Settings (sliders: smoothing, visibility threshold, FPS)
+  RIGHT  : Joint angles + scrollable log
 
-Indithas:
+Run:
     python scripts/run_gui.py [--camera IDX]
 
-Fugg: Pillow  (pip install Pillow)
+Deps: Pillow (pip install Pillow)
 """
 
 from __future__ import annotations
@@ -29,17 +29,13 @@ sys.path.insert(0, str(_ROOT))
 
 from real2sim import config
 from real2sim.calibration import BodyCalibration, run_calibration
-from real2sim.fusion import (
-    MODE_3D, MODE_2D, MODE_FUSION, MODES, MODE_LABELS,
-    make_2d_landmarks, fuse_dual_landmarks, arms_visible,
-)
-from real2sim.ik import ArmIK
 from real2sim.one_euro import OneEuroFilterArray
 from real2sim.pose import PoseEstimator
+from real2sim.retarget import compute_arm_angles, compute_debug_info
 from real2sim.sim import G1Sim
 
 try:
-    from PIL import Image, ImageTk, ImageDraw, ImageFont
+    from PIL import Image, ImageTk, ImageDraw
     _PIL_OK = True
 except ImportError:
     _PIL_OK = False
@@ -49,66 +45,53 @@ from tkinter import ttk
 
 
 # =============================================================================
-# Kommunikacios adatstrukturak
+# Communication structures
 # =============================================================================
 
 @dataclass
 class SimFrame:
-    cam_bgr:      Optional[np.ndarray]
-    sim_rgb:      Optional[np.ndarray]
-    fps:          float
-    targets:      Optional[np.ndarray]   # (14,) izuleti szogek
-    calib:        Optional[BodyCalibration]
-    status:       str
-    cam_side_bgr: Optional[np.ndarray] = None   # csak Mode C-ben
-    debug_info:   Optional[dict]        = None   # debug adatok
+    cam_bgr:    Optional[np.ndarray]
+    sim_rgb:    Optional[np.ndarray]
+    fps:        float
+    targets:    Optional[np.ndarray]   # (14,) joint angles
+    calib:      Optional[BodyCalibration]
+    status:     str
+    debug_info: Optional[dict]        = None
 
 
 @dataclass
 class SimSettings:
-    """Elo beallitasok -- GUI-bol barmikorhivhato."""
-    oef_min_cutoff:      float = config.OEF_MIN_CUTOFF
-    oef_beta:            float = config.OEF_BETA
-    visibility_thresh:   float = config.VISIBILITY_THRESHOLD
-    ik_posture_cost:     float = config.IK_POSTURE_COST
-    target_fps:          int   = config.TARGET_FPS
-    debug_mode:          bool  = False
-    # Mode + kamerak
-    mode:                str   = MODE_3D
-    side_camera_idx:     int   = 0           # csak Mode C-ben hasznalt
+    """Live-tunable settings -- writable from the GUI thread."""
+    oef_min_cutoff:    float = config.OEF_MIN_CUTOFF
+    oef_beta:          float = config.OEF_BETA
+    visibility_thresh: float = config.VISIBILITY_THRESHOLD
+    target_fps:        int   = config.TARGET_FPS
+    debug_mode:        bool  = False
 
 
 # =============================================================================
-# Hatterthrad
+# Worker thread
 # =============================================================================
 
 class SimThread(threading.Thread):
-    """Futtatja a kamera -> pose -> OEF -> [mode-szintezis] -> IK -> fizika ciklust.
-
-    Modok (settings.mode):
-        MODE_3D     : 1 kamera, MediaPipe 3D becsles (default)
-        MODE_2D     : 1 kamera, frontalis sikra projektalt
-        MODE_FUSION : 2 kamera (front + side @90 jobb), tengely-szerinti fuzio
-    """
+    """Runs the camera → pose → OEF → retarget → physics loop."""
 
     def __init__(
         self,
-        camera_idx:      int,
-        mirror:          bool,
-        frame_q:         queue.Queue,
-        log_q:           queue.Queue,
-        settings:        SimSettings,
-        side_camera_idx: int = 0,
+        camera_idx: int,
+        mirror:     bool,
+        frame_q:    queue.Queue,
+        log_q:      queue.Queue,
+        settings:   SimSettings,
     ) -> None:
         super().__init__(daemon=True)
-        self.camera_idx      = camera_idx       # front kamera
-        self.side_camera_idx = side_camera_idx  # csak Mode C-ben
-        self.mirror          = mirror
-        self.frame_q         = frame_q
-        self.log_q           = log_q
-        self.settings        = settings
-        self._stop_evt       = threading.Event()
-        self._calib_evt      = threading.Event()
+        self.camera_idx = camera_idx
+        self.mirror     = mirror
+        self.frame_q    = frame_q
+        self.log_q      = log_q
+        self.settings   = settings
+        self._stop_evt  = threading.Event()
+        self._calib_evt = threading.Event()
         self.error: Optional[str] = None
 
     def stop(self)                -> None: self._stop_evt.set()
@@ -117,312 +100,232 @@ class SimThread(threading.Thread):
     def _log(self, msg: str) -> None:
         self.log_q.put(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-    # -- Segit metodusok ------------------------------------------------------
-
-    def _open_camera(self, idx: int, label: str):
+    def _open_camera(self, idx: int):
         import cv2
-        self._log(f"{label} kamera megnyitasa (index={idx})...")
+        self._log(f"Opening camera (index={idx})...")
         cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  config.FRAME_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
         if not cap.isOpened():
-            raise RuntimeError(f"Nem nyilik meg a {label} kamera (index={idx})")
+            raise RuntimeError(f"Cannot open camera (index={idx})")
         return cap
 
-    # -- Fo ciklus ------------------------------------------------------------
+    # -- Main loop --------------------------------------------------------------
 
     def run(self) -> None:  # noqa: C901
         import cv2
 
-        cap_front = None
-        cap_side  = None
-        pose_front = None
-        pose_side  = None
+        cap  = None
+        pose = None
+        _csv_file = None
+        _csv_writer = None
 
         try:
-            mode = self.settings.mode
-            self._log(f"Mod: {MODE_LABELS.get(mode, mode)}")
+            cap = self._open_camera(self.camera_idx)
 
-            # -- Kamerak --
-            cap_front = self._open_camera(self.camera_idx, "Front")
+            self._log("Loading pose estimator...")
+            pose = PoseEstimator()
 
-            if mode == MODE_FUSION:
-                if self.side_camera_idx == self.camera_idx:
-                    raise RuntimeError(
-                        f"A side es a front kamera index nem lehet azonos "
-                        f"(mindketto = {self.camera_idx})"
-                    )
-                cap_side = self._open_camera(self.side_camera_idx, "Side")
-                self._log("FIGYELEM: Mode C-ben az FPS feleződhet "
-                          "(2 pose-becsles soros). Csokkentsd a target FPS-t ha akadozik.")
-
-            # -- Pose estimator(ok) --
-            self._log("Pose estimator betoltese...")
-            pose_front = PoseEstimator()
-            if mode == MODE_FUSION:
-                pose_side = PoseEstimator()
-
-            # -- Szimulacios modell --
-            self._log("G1 MuJoCo modell betoltese...")
+            self._log("Loading G1 MuJoCo model...")
             sim      = G1Sim()
             renderer = sim.make_renderer(config.FRAME_W, config.FRAME_H)
-            self._log(f"G1 betoltve -- robot kar: {sim.arm_length_robot:.3f} m")
+            self._log(f"G1 loaded -- robot arm: {sim.arm_length_robot:.3f} m")
 
-            # -- Kalibraciot betoltese cache-bol --
             calib = BodyCalibration.load(config.CALIBRATION_PATH)
             if calib is not None:
                 self._log(
-                    f"Kalibraciot betoltve -- scale={calib.scale:.3f}, "
-                    f"felhasznaloi kar={calib.arm_length_user:.3f} m"
+                    f"Calibration loaded -- scale={calib.scale:.3f}, "
+                    f"user_arm={calib.arm_length_user:.3f} m"
                 )
             else:
-                self._log("Nincs kalibraciot -- nyomd meg a Kalibraciot gombot!")
-
-            # -- IK + OEF szurok --
-            self._log("IK inicializalasa...")
-            arm_ik         = ArmIK(sim)
-            lm_filter_f    = OneEuroFilterArray(shape=(33, 3))
-            lm_filter_s    = (
-                OneEuroFilterArray(shape=(33, 3)) if mode == MODE_FUSION else None
+                self._log("No calibration cache -- press Calibrate (3 poses).")
+            anatomical_zero = (
+                np.asarray(calib.anatomical_zero, dtype=np.float64)
+                if calib is not None else None
             )
-            prev_oef          = (self.settings.oef_min_cutoff, self.settings.oef_beta)
-            prev_posture_cost = self.settings.ik_posture_cost
 
-            # Fusion mode allapot: utolso jol meresett rel_body[1] freezehez
-            # Kulcsok: "left_wrist", "right_wrist", "left_elbow", "right_elbow"
-            last_y_state = {
-                "left_wrist":  0.0, "right_wrist":  0.0,
-                "left_elbow":  0.0, "right_elbow":  0.0,
-            }
+            lm_filter = OneEuroFilterArray(shape=(33, 3))
+            prev_oef  = (self.settings.oef_min_cutoff, self.settings.oef_beta)
+
             _cached_sim_pixels = None
-            self._log("Keszen all.")
+            self._log("Ready.")
 
             t0           = time.time()
             frame_idx    = 0
-            # Initialise ctrl targets from the current stand-pose ctrl values
-            # so step_smooth() starts from the correct resting position.
             last_targets = sim.data.ctrl[sim.actuator_ids].copy()
-            _ik_valid    = False          # True once the first IK result arrives
-            _t_prev      = time.time()   # wall-clock time of previous frame
-            _csv_file    = None
-            _csv_writer  = None
+            _targets_valid = False
+            _t_prev      = time.time()
 
             while not self._stop_evt.is_set():
                 s = self.settings
 
-                # -- Actual elapsed time since previous frame --
-                _t_now   = time.time()
+                _t_now = time.time()
                 actual_dt = max(0.005, min(_t_now - _t_prev, 0.5))
-                _t_prev  = _t_now
+                _t_prev = _t_now
 
-                # n_substeps computed from real elapsed time so physics runs
-                # at wall-clock speed regardless of MediaPipe latency.
                 n_substeps = max(1, round(actual_dt / sim.dt))
-
-                # dt for OEF filter = actual inter-frame interval
                 dt = actual_dt
 
-                # -- OEF ujraepitese ha megvaltoztak a parameterek --
+                # -- Rebuild OEF if parameters changed --
                 cur_oef = (s.oef_min_cutoff, s.oef_beta)
                 if cur_oef != prev_oef:
-                    lm_filter_f = OneEuroFilterArray(
+                    lm_filter = OneEuroFilterArray(
                         shape=(33, 3),
                         min_cutoff=s.oef_min_cutoff, beta=s.oef_beta,
                     )
-                    if mode == MODE_FUSION:
-                        lm_filter_s = OneEuroFilterArray(
-                            shape=(33, 3),
-                            min_cutoff=s.oef_min_cutoff, beta=s.oef_beta,
-                        )
                     prev_oef = cur_oef
                     self._log(
-                        f"OEF frissitve: min_cutoff={s.oef_min_cutoff:.2f}, "
+                        f"OEF updated: min_cutoff={s.oef_min_cutoff:.2f}, "
                         f"beta={s.oef_beta:.3f}"
                     )
 
-                # -- IK posture cost frissitese (csak valtozaskor) --
-                if s.ik_posture_cost != prev_posture_cost:
-                    try:
-                        arm_ik._posture_task.set_cost(s.ik_posture_cost)
-                        prev_posture_cost = s.ik_posture_cost
-                        self._log(f"IK posture cost frissitve: {s.ik_posture_cost:.4f}")
-                    except Exception as exc:
-                        self._log(f"posture cost frissites sikertelen: {exc}")
-
-                # -- Ujrakalibralasi kerest (mindig front kamerabol) --
+                # -- Calibration request --
                 if self._calib_evt.is_set():
                     self._calib_evt.clear()
-                    self._log("T-poz kalibraciot indul... (tartsd ki a karjaidat!)")
+                    self._log("3-pose calibration starting...")
+
+                    # Cache one rendered sim frame so the sim preview stays
+                    # populated during the (~22 s) calibration.
+                    renderer.update_scene(sim.data)
+                    cached_sim_calib = renderer.render()
+
+                    def _calib_frame_cb(bgr_image):
+                        sf_calib = SimFrame(
+                            cam_bgr    = bgr_image,
+                            sim_rgb    = cached_sim_calib,
+                            fps        = 0.0,
+                            targets    = None,
+                            calib      = None,
+                            status     = "Calibrating",
+                            debug_info = None,
+                        )
+                        try:
+                            self.frame_q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self.frame_q.put(sf_calib)
+
                     try:
                         calib = run_calibration(
-                            cap_front, pose_front,
+                            cap, pose,
                             arm_length_robot=sim.arm_length_robot,
+                            on_frame=_calib_frame_cb,
+                            on_abort=lambda: self._stop_evt.is_set(),
                         )
                         calib.save()
+                        anatomical_zero = np.asarray(
+                            calib.anatomical_zero, dtype=np.float64,
+                        )
                         self._log(
-                            f"Kalibraciot kesz -- scale={calib.scale:.3f}, "
-                            f"felhasznaloi kar={calib.arm_length_user:.3f} m"
+                            f"Calibration done -- scale={calib.scale:.3f}, "
+                            f"shoulder_w={calib.shoulder_width_user:.3f} m, "
+                            f"torso_h={calib.torso_height_user:.3f} m"
                         )
                     except RuntimeError as exc:
-                        self._log(f"KALIBRACIOT HIBA: {exc}")
+                        self._log(f"CALIBRATION ERROR: {exc}")
 
-                # -- Front kamera olvasas + pose --
-                ret_f, frame_f = cap_front.read()
-                if not ret_f:
-                    self._log("HIBA: Front kamera olvasas sikertelen!")
+                # -- Camera read + pose --
+                ret, frame = cap.read()
+                if not ret:
+                    self._log("ERROR: camera read failed!")
                     time.sleep(0.1)
                     continue
-                res_f = pose_front.process(frame_f)
+                res = pose.process(frame)
 
-                # -- Side kamera olvasas + pose (csak Mode C) --
-                res_s = None
-                cam_side_show = None
-                if mode == MODE_FUSION and cap_side is not None and pose_side is not None:
-                    ret_s, frame_s = cap_side.read()
-                    if ret_s:
-                        res_s = pose_side.process(frame_s)
-                        cam_side_show = (
-                            cv2.flip(res_s.annotated, 1) if self.mirror
-                            else res_s.annotated.copy()
-                        )
-                    elif frame_idx % 90 == 0:
-                        self._log("FIGYELEM: side kamera olvasas sikertelen.")
-
-                # -- IK pipeline --
+                # -- Retargeting --
                 thr = s.visibility_thresh
-                if calib is not None and res_f.world_landmarks is not None:
-                    front_ok = arms_visible(res_f.visibility, thr)
-
-                    if front_ok:
-                        # Front kamera szureles
-                        lms_f = lm_filter_f.update(res_f.world_landmarks, dt)
-
-                        # Mode-szerinti szintezis
+                dbg = None
+                if res.world_landmarks is not None:
+                    vis = res.visibility
+                    arms_visible = (
+                        vis is not None
+                        and all(vis[i] >= thr for i in (
+                            config.LM_LEFT_SHOULDER,  config.LM_RIGHT_SHOULDER,
+                            config.LM_LEFT_ELBOW,     config.LM_RIGHT_ELBOW,
+                            config.LM_LEFT_WRIST,     config.LM_RIGHT_WRIST,
+                            config.LM_LEFT_HIP,       config.LM_RIGHT_HIP,
+                        ))
+                    )
+                    if arms_visible:
+                        lms_smooth = lm_filter.update(res.world_landmarks, dt)
                         try:
-                            if mode == MODE_3D:
-                                synth = lms_f
-                            elif mode == MODE_2D:
-                                synth = make_2d_landmarks(lms_f)
-                            elif mode == MODE_FUSION:
-                                side_ok = (
-                                    res_s is not None
-                                    and res_s.world_landmarks is not None
-                                    and arms_visible(res_s.visibility, thr)
-                                )
-                                lms_s = (
-                                    lm_filter_s.update(res_s.world_landmarks, dt)
-                                    if side_ok and lm_filter_s is not None
-                                    else None
-                                )
-                                synth = fuse_dual_landmarks(
-                                    lms_f, lms_s, last_y_state, side_ok=side_ok,
-                                )
-                                if not side_ok and frame_idx % 90 == 0:
-                                    self._log(
-                                        "Side kamera nem lathato karok -- "
-                                        "freeze az utolso elore-hatra erteken."
-                                    )
-                            else:
-                                synth = lms_f
-
-                            last_targets = arm_ik.step(synth, calib, dt=dt, visibility=res_f.visibility)
-                            _ik_valid = True
-                        except Exception as exc:
-                            self._log(f"IK lepes hiba: {exc}")
-
-                    elif frame_idx % 90 == 0:
-                        vis = res_f.visibility
-                        if vis is not None:
-                            vL_sh = vis[config.LM_LEFT_SHOULDER]
-                            vR_sh = vis[config.LM_RIGHT_SHOULDER]
-                            vL_wr = vis[config.LM_LEFT_WRIST]
-                            vR_wr = vis[config.LM_RIGHT_WRIST]
-                            self._log(
-                                f"Front: karok nem lathatoak (kuszob={thr:.2f}): "
-                                f"L_sh={vL_sh:.2f} R_sh={vR_sh:.2f} "
-                                f"L_wr={vL_wr:.2f} R_wr={vR_wr:.2f}"
+                            last_targets = compute_arm_angles(
+                                lms_smooth, anatomical_zero=anatomical_zero,
                             )
-                        else:
-                            self._log("Front: nincs lathatosagi adat (pose nem detektalt)")
+                            _targets_valid = True
+                            # Always populate the live-debug dict so the GUI
+                            # panel has data, calibrated or not.
+                            dbg = compute_debug_info(
+                                lms_smooth, anatomical_zero, res.visibility,
+                            )
+                        except Exception as exc:
+                            self._log(f"Retarget error: {exc}")
+                    elif frame_idx % 90 == 0:
+                        self._log(f"Required landmarks below threshold {thr:.2f}")
 
-                # -- Fizika: valós idejű step + per-substep ctrl simítás --
+                # -- Physics step --
                 sim.step_smooth(
                     n_substeps=n_substeps,
-                    ik_target=last_targets if _ik_valid else None,
+                    ik_target=last_targets if _targets_valid else None,
                 )
 
-                # -- Render (throttled: csak minden _RENDER_EVERY-edik frame-ben) --
+                # -- Render (throttled) --
                 if frame_idx % _RENDER_EVERY == 0:
                     renderer.update_scene(sim.data)
                     _cached_sim_pixels = renderer.render()
                 sim_pixels = _cached_sim_pixels
 
                 cam_show = (
-                    cv2.flip(res_f.annotated, 1) if self.mirror
-                    else res_f.annotated.copy()
+                    cv2.flip(res.annotated, 1) if self.mirror
+                    else res.annotated.copy()
                 )
 
                 fps = (frame_idx + 1) / max(1e-6, time.time() - t0)
-                dbg = arm_ik.last_debug if arm_ik.last_debug else None
 
-                # -- Debug overlay + CSV logging --
-                if s.debug_mode and dbg:
+                # -- Debug overlay + CSV --
+                if s.debug_mode and dbg is not None:
                     import csv as _csv
-                    from pathlib import Path as _Path
-
-                    # CSV megnyitasa (ha meg nincs)
                     if _csv_file is None:
-                        _csv_path = _Path(__file__).resolve().parent.parent / "debug_log.csv"
+                        _csv_path = _ROOT / "debug_log.csv"
                         _csv_file = open(_csv_path, "w", newline="", encoding="utf-8")
                         _csv_writer = _csv.writer(_csv_file)
                         _csv_writer.writerow([
-                            "frame", "t", "mode", "fps",
-                            "L_body_x", "L_body_y", "L_body_z",
-                            "R_body_x", "R_body_y", "R_body_z",
-                            "L_tgt_x",  "R_tgt_x",
-                        ])
+                            "frame", "t", "fps",
+                            "L_up_x", "L_up_y", "L_up_z",
+                            "L_fo_x", "L_fo_y", "L_fo_z",
+                            "R_up_x", "R_up_y", "R_up_z",
+                            "R_fo_x", "R_fo_y", "R_fo_z",
+                        ] + [f"q_raw{i:02d}" for i in range(14)]
+                          + [f"q_g1{i:02d}"  for i in range(14)])
                         self._log(f"Debug CSV: {_csv_path}")
 
-                    Lb = dbg["L_body"]
-                    Rb = dbg["R_body"]
+                    Lu = dbg["L_upper_body"]; Lf = dbg["L_fore_body"]
+                    Ru = dbg["R_upper_body"]; Rf = dbg["R_fore_body"]
                     _csv_writer.writerow([
-                        frame_idx, f"{time.time()-t0:.3f}", mode, f"{fps:.1f}",
-                        f"{Lb[0]:.4f}", f"{Lb[1]:.4f}", f"{Lb[2]:.4f}",
-                        f"{Rb[0]:.4f}", f"{Rb[1]:.4f}", f"{Rb[2]:.4f}",
-                        f"{dbg['L_tgt_x']:.4f}", f"{dbg['R_tgt_x']:.4f}",
-                    ])
+                        frame_idx, f"{time.time()-t0:.3f}", f"{fps:.1f}",
+                        f"{Lu[0]:.4f}", f"{Lu[1]:.4f}", f"{Lu[2]:.4f}",
+                        f"{Lf[0]:.4f}", f"{Lf[1]:.4f}", f"{Lf[2]:.4f}",
+                        f"{Ru[0]:.4f}", f"{Ru[1]:.4f}", f"{Ru[2]:.4f}",
+                        f"{Rf[0]:.4f}", f"{Rf[1]:.4f}", f"{Rf[2]:.4f}",
+                    ] + [f"{x:+.4f}" for x in dbg["q_raw"]]
+                      + [f"{x:+.4f}" for x in dbg["q_g1_target"]])
                     if frame_idx % 10 == 0:
                         _csv_file.flush()
-
-                    # Kamera kep overlay
-                    oy = cam_show.shape[0] - 10
-                    for txt, col in [
-                        (f"MODE: {mode}  FPS:{fps:.1f}", (200, 200, 50)),
-                        (f"L body  x={Lb[0]:+.3f}  y={Lb[1]:+.3f}  z={Lb[2]:+.3f}", (100, 220, 100)),
-                        (f"R body  x={Rb[0]:+.3f}  y={Rb[1]:+.3f}  z={Rb[2]:+.3f}", (100, 180, 255)),
-                        (f"L tgt_X={dbg['L_tgt_x']:+.3f}  R tgt_X={dbg['R_tgt_x']:+.3f}", (220, 180, 100)),
-                    ]:
-                        oy -= 20
-                        cv2.putText(cam_show, txt, (6, oy),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
-
                 elif not s.debug_mode and _csv_file is not None:
                     _csv_file.close()
-                    _csv_file   = None
+                    _csv_file = None
                     _csv_writer = None
-                    self._log("Debug CSV lezarva.")
+                    self._log("Debug CSV closed.")
 
                 sf = SimFrame(
-                    cam_bgr      = cam_show,
-                    sim_rgb      = sim_pixels,
-                    fps          = fps,
-                    targets      = last_targets.copy(),
-                    calib        = calib,
-                    status       = "Fut" if calib else "Kalibralatlan",
-                    cam_side_bgr = cam_side_show,
-                    debug_info   = dbg,
+                    cam_bgr    = cam_show,
+                    sim_rgb    = sim_pixels,
+                    fps        = fps,
+                    targets    = last_targets.copy(),
+                    calib      = calib,
+                    status     = "Running" if calib else "Not calibrated",
+                    debug_info = dbg,
                 )
-                # Csak a legfrissebb frame-t tartjuk
                 try:
                     self.frame_q.get_nowait()
                 except queue.Empty:
@@ -431,41 +334,38 @@ class SimThread(threading.Thread):
 
                 frame_idx += 1
 
-                # -- Wall-clock pacing (fixed rate, independent of actual_dt) --
                 _dt_target = 1.0 / max(1, s.target_fps)
-                elapsed    = time.time() - t0
-                expected   = frame_idx * _dt_target
-                sleep_t    = expected - elapsed
+                elapsed = time.time() - t0
+                expected = frame_idx * _dt_target
+                sleep_t = expected - elapsed
                 if sleep_t > 0:
                     time.sleep(sleep_t)
 
         except Exception as exc:
             import traceback
             self.error = traceback.format_exc()
-            self._log(f"FATALIS HIBA: {exc}")
+            self._log(f"FATAL ERROR: {exc}")
         finally:
             if _csv_file is not None:
                 try:
                     _csv_file.close()
                 except Exception:
                     pass
-            for cap in (cap_front, cap_side):
-                try:
-                    if cap is not None:
-                        cap.release()
-                except Exception:
-                    pass
-            for pe in (pose_front, pose_side):
-                try:
-                    if pe is not None:
-                        pe.close()
-                except Exception:
-                    pass
-            self._log("Szal leallitva.")
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+            try:
+                if pose is not None:
+                    pose.close()
+            except Exception:
+                pass
+            self._log("Thread stopped.")
 
 
 # =============================================================================
-# Szinpaletta (sotet tema)
+# Theme
 # =============================================================================
 BG      = "#1e1e2e"
 BG2     = "#2a2a3d"
@@ -478,14 +378,13 @@ ORANGE  = "#fab387"
 TEXT    = "#cdd6f4"
 SUBTEXT = "#6c7086"
 
-POLL_MS = 33   # ~30 Hz GUI frissites
+POLL_MS = 33   # ~30 Hz GUI refresh
 
-# Offscreen renderer: eredeti felbontas, de csak minden 3. frame-ben renderel
-_RENDER_EVERY = 3   # display ~10 fps, fizika 30 fps
+_RENDER_EVERY = 3   # render every 3rd frame to keep CPU happy
 
 
 # =============================================================================
-# Segitfuggvenyek
+# Helpers
 # =============================================================================
 
 def _btn(parent, text, bg, fg, cmd, **kw):
@@ -500,7 +399,6 @@ def _btn(parent, text, bg, fg, cmd, **kw):
 
 
 def _placeholder_img(w: int, h: int, text: str):
-    """Sotet hatter, kozepre irt szoveggel."""
     img  = Image.new("RGB", (w, h), (20, 20, 30))
     draw = ImageDraw.Draw(img)
     bb   = draw.textbbox((0, 0), text)
@@ -509,37 +407,22 @@ def _placeholder_img(w: int, h: int, text: str):
     return ImageTk.PhotoImage(img)
 
 
-# =============================================================================
-# Csuszko sor segitmetodus
-# =============================================================================
-
-def _make_slider(
-    parent, row, label, var: tk.DoubleVar,
-    from_, to, resolution,
-    fmt=".3f", orient="horizontal",
-):
-    """Egysoros csuszko: [cimke]  [ertek]  [------slider------]"""
+def _make_slider(parent, row, label, var, from_, to, resolution, fmt=".3f"):
     tk.Label(
         parent, text=label, bg=BG2, fg=TEXT,
         font=("Segoe UI", 8), anchor="w", width=20,
     ).grid(row=row, column=0, sticky="w", padx=(4, 0), pady=2)
-
     val_lbl = tk.Label(
         parent, text=f"{var.get():{fmt}}", bg=BG2, fg=YELLOW,
         font=("Consolas", 8, "bold"), width=7, anchor="e",
     )
     val_lbl.grid(row=row, column=1, padx=(2, 4), pady=2)
-
     sl = tk.Scale(
-        parent,
-        variable=var, from_=from_, to=to, resolution=resolution,
-        orient=orient,
+        parent, variable=var, from_=from_, to=to, resolution=resolution,
+        orient="horizontal",
         bg=BG2, fg=TEXT, troughcolor=BG3,
-        activebackground=ACCENT,
-        highlightthickness=0,
-        sliderrelief="flat",
-        showvalue=False,
-        length=160,
+        activebackground=ACCENT, highlightthickness=0,
+        sliderrelief="flat", showvalue=False, length=160,
         command=lambda v: val_lbl.configure(text=f"{float(v):{fmt}}"),
     )
     sl.grid(row=row, column=2, sticky="ew", padx=(0, 4), pady=2)
@@ -547,7 +430,7 @@ def _make_slider(
 
 
 # =============================================================================
-# Fo GUI osztaly
+# Main GUI
 # =============================================================================
 
 class Real2SimGUI:
@@ -556,24 +439,20 @@ class Real2SimGUI:
         self._thread: Optional[SimThread] = None
         self._running = False
 
-        self._mirror       = tk.BooleanVar(value=True)
-        self._cam_idx      = tk.IntVar(value=start_camera)
-        self._side_cam_idx = tk.IntVar(value=0)
-        self._mode_var     = tk.StringVar(value=MODE_3D)
+        self._mirror  = tk.BooleanVar(value=True)
+        self._cam_idx = tk.IntVar(value=start_camera)
 
-        # -- Elo beallitasok (csuszkok altal vezerlve) --
         self._settings = SimSettings()
-        self._s_oef_cutoff  = tk.DoubleVar(value=self._settings.oef_min_cutoff)
-        self._s_oef_beta    = tk.DoubleVar(value=self._settings.oef_beta)
-        self._s_vis_thresh  = tk.DoubleVar(value=self._settings.visibility_thresh)
-        self._s_ik_posture  = tk.DoubleVar(value=self._settings.ik_posture_cost)
-        self._s_fps         = tk.IntVar(value=self._settings.target_fps)
-        self._s_debug       = tk.BooleanVar(value=False)
+        self._s_oef_cutoff = tk.DoubleVar(value=self._settings.oef_min_cutoff)
+        self._s_oef_beta   = tk.DoubleVar(value=self._settings.oef_beta)
+        self._s_vis_thresh = tk.DoubleVar(value=self._settings.visibility_thresh)
+        self._s_fps        = tk.IntVar(value=self._settings.target_fps)
+        self._s_debug      = tk.BooleanVar(value=False)
 
         self._frame_q: queue.Queue[SimFrame] = queue.Queue(maxsize=1)
         self._log_q:   queue.Queue[str]      = queue.Queue()
 
-        root.title("Real2Sim -- Unitree G1 vezerlohely")
+        root.title("Real2Sim -- Unitree G1 control")
         root.configure(bg=BG)
         root.resizable(True, True)
         root.minsize(1100, 700)
@@ -582,278 +461,181 @@ class Real2SimGUI:
         self._poll()
 
     # =========================================================================
-    # UI epites
+    # UI build
     # =========================================================================
 
     def _build_ui(self) -> None:
         root = self.root
-
-        # Foablak racsozata:
-        #  sor 0 : preview-k (nagy, nyujthato)
-        #  sor 1 : vezerlok (fix)
-        #  sor 2 : beallitasok | izuletek + log
-        root.rowconfigure(0, weight=5)    # preview-k: 5 resz
-        root.rowconfigure(1, weight=0)    # vezerlok: fix
-        root.rowconfigure(2, weight=2)    # also panel: 2 resz
+        # Previews vs. bottom panel: leave ~half the height for the bottom so
+        # joint angles + debug + log all fit comfortably on one page.
+        root.rowconfigure(0, weight=3)   # camera + sim previews
+        root.rowconfigure(1, weight=0)   # control bar (fixed)
+        root.rowconfigure(2, weight=3)   # joints + debug + log
         root.columnconfigure(0, weight=1)
 
-        # ── 0. sor: preview-k ────────────────────────────────────────────────
+        # Preview row
         self._preview_row = tk.Frame(root, bg=BG)
         self._preview_row.grid(row=0, column=0, sticky="nsew", padx=4, pady=(8, 2))
+        self._preview_row.rowconfigure(0, weight=1)
+        self._preview_row.columnconfigure(0, weight=1)
+        self._preview_row.columnconfigure(1, weight=1)
 
-        # Front kamera preview
         self._cam_frame = tk.Frame(self._preview_row, bg=BG2, bd=0)
         self._cam_frame.rowconfigure(1, weight=1)
         self._cam_frame.columnconfigure(0, weight=1)
-        self._cam_title = tk.Label(
-            self._cam_frame, text="  Kamera", bg=BG2, fg=ACCENT,
+        tk.Label(
+            self._cam_frame, text="  Camera", bg=BG2, fg=ACCENT,
             font=("Segoe UI", 10, "bold"), anchor="w",
-        )
-        self._cam_title.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
+        ).grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
         self._cam_lbl = tk.Label(self._cam_frame, bg="#000")
         self._cam_lbl.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        self._cam_frame.grid(row=0, column=0, sticky="nsew", padx=(4, 2), pady=2)
 
-        # Side kamera preview (csak Mode C-ben latszik)
-        self._side_cam_frame = tk.Frame(self._preview_row, bg=BG2, bd=0)
-        self._side_cam_frame.rowconfigure(1, weight=1)
-        self._side_cam_frame.columnconfigure(0, weight=1)
-        tk.Label(
-            self._side_cam_frame, text="  Side kamera (90 jobb)",
-            bg=BG2, fg=ORANGE, font=("Segoe UI", 10, "bold"), anchor="w",
-        ).grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
-        self._side_cam_lbl = tk.Label(self._side_cam_frame, bg="#000")
-        self._side_cam_lbl.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
-
-        # Szimulacios preview
         self._sim_frame = tk.Frame(self._preview_row, bg=BG2, bd=0)
         self._sim_frame.rowconfigure(1, weight=1)
         self._sim_frame.columnconfigure(0, weight=1)
         tk.Label(
-            self._sim_frame, text="  Szimulacios", bg=BG2, fg=ACCENT,
+            self._sim_frame, text="  Simulation", bg=BG2, fg=ACCENT,
             font=("Segoe UI", 10, "bold"), anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
         self._sim_lbl = tk.Label(self._sim_frame, bg="#000")
         self._sim_lbl.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        self._sim_frame.grid(row=0, column=1, sticky="nsew", padx=(2, 4), pady=2)
 
         if _PIL_OK:
             for lbl, txt in (
-                (self._cam_lbl,      "front nem aktiv"),
-                (self._side_cam_lbl, "side nem aktiv"),
-                (self._sim_lbl,      "sim nem fut"),
+                (self._cam_lbl, "camera not active"),
+                (self._sim_lbl, "sim not running"),
             ):
                 ph = _placeholder_img(480, 320, txt)
                 lbl.configure(image=ph)
                 lbl.image = ph
 
-        # Alap layout (Mode A/B): cam | sim
-        self._apply_mode_layout(MODE_3D)
-
-        # ── 1. sor: vezerlok (2 alsor) ───────────────────────────────────────
-        ctrl_outer = tk.Frame(root, bg=BG3, padx=8, pady=4)
-        ctrl_outer.grid(row=1, column=0, sticky="ew", padx=4, pady=2)
-
-        # 1.A alsor: Start/Stop/Kalibraciot + statusz
-        ctrl = tk.Frame(ctrl_outer, bg=BG3)
-        ctrl.pack(fill="x", pady=(0, 2))
+        # Control row
+        ctrl = tk.Frame(root, bg=BG3, padx=8, pady=4)
+        ctrl.grid(row=1, column=0, sticky="ew", padx=4, pady=2)
 
         self._start_btn = _btn(ctrl, "  Start ", GREEN, BG, self._on_start)
         self._start_btn.pack(side="left", padx=(0, 4))
-
-        self._stop_btn = _btn(ctrl, "  Stop  ", RED, BG, self._on_stop, state="disabled")
+        self._stop_btn  = _btn(ctrl, "  Stop  ", RED, BG, self._on_stop, state="disabled")
         self._stop_btn.pack(side="left", padx=(0, 4))
-
-        self._calib_btn = _btn(ctrl, "  Kalibraciot (T-poz) ", BG2, ACCENT,
+        self._calib_btn = _btn(ctrl, "  Calibrate (3 poses) ", BG2, ACCENT,
                                self._on_calibrate, state="disabled")
-        self._calib_btn.pack(side="left", padx=(0, 16))
+        self._calib_btn.pack(side="left", padx=(0, 4))
+
+        self._clear_calib_btn = _btn(
+            ctrl, "  Clear calib ", BG2, ORANGE, self._on_clear_calibration,
+        )
+        self._clear_calib_btn.pack(side="left", padx=(0, 16))
 
         tk.Checkbutton(
-            ctrl, text="Tukrozos",
-            variable=self._mirror,
+            ctrl, text="Mirror", variable=self._mirror,
             bg=BG3, fg=TEXT, selectcolor=BG2,
             activebackground=BG3, activeforeground=ACCENT,
             font=("Segoe UI", 9),
             command=self._on_mirror_toggle,
         ).pack(side="left", padx=(0, 16))
 
-        # Statusz jobb oldal
         self._fps_var   = tk.StringVar(value="--")
-        self._state_var = tk.StringVar(value="Leallva")
+        self._state_var = tk.StringVar(value="Stopped")
         self._scale_var = tk.StringVar(value="--")
-        self._cam_info  = tk.StringVar(value=f"kamera: {self._cam_idx.get()}")
 
         for lbl, var, col in (
             ("FPS:",    self._fps_var,   YELLOW),
             ("Scale:",  self._scale_var, TEXT),
-            ("Statusz:",self._state_var, GREEN),
+            ("Status:", self._state_var, GREEN),
         ):
             tk.Label(ctrl, text=lbl, bg=BG3, fg=SUBTEXT,
                      font=("Segoe UI", 8)).pack(side="left", padx=(8, 2))
             tk.Label(ctrl, textvariable=var, bg=BG3, fg=col,
                      font=("Segoe UI", 9, "bold"), width=8).pack(side="left")
 
-        # 1.B alsor: Mod + kamerak
-        ctrl2 = tk.Frame(ctrl_outer, bg=BG3)
-        ctrl2.pack(fill="x", pady=(2, 0))
-
-        tk.Label(ctrl2, text="Mod:", bg=BG3, fg=TEXT,
-                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 6))
-
-        for mode_const, label_text in (
-            (MODE_3D,     "1 kam (3D)"),
-            (MODE_2D,     "1 kam (2D, sik)"),
-            (MODE_FUSION, "2 kam (fuzio)"),
-        ):
-            tk.Radiobutton(
-                ctrl2, text=label_text,
-                variable=self._mode_var, value=mode_const,
-                bg=BG3, fg=TEXT, selectcolor=BG2,
-                activebackground=BG3, activeforeground=ACCENT,
-                font=("Segoe UI", 9),
-                command=self._on_mode_change,
-            ).pack(side="left", padx=(0, 6))
-
-        tk.Label(ctrl2, text="  |  Front:", bg=BG3, fg=SUBTEXT,
+        tk.Label(ctrl, text="  |  Camera:", bg=BG3, fg=SUBTEXT,
                  font=("Segoe UI", 9)).pack(side="left", padx=(8, 2))
         tk.Spinbox(
-            ctrl2, from_=0, to=9, width=3,
+            ctrl, from_=0, to=9, width=3,
             textvariable=self._cam_idx,
             bg=BG2, fg=TEXT, buttonbackground=BG2,
             insertbackground=TEXT, relief="flat",
             font=("Segoe UI", 10, "bold"),
         ).pack(side="left", padx=(2, 4))
-
-        # Side kamera spinbox + label (csak Mode C-ben latszik)
-        self._side_cam_lbl_w = tk.Label(
-            ctrl2, text="Side:", bg=BG3, fg=ORANGE,
-            font=("Segoe UI", 9, "bold"),
+        _btn(ctrl, "Apply camera", BG2, ORANGE, self._on_camera_apply).pack(
+            side="left", padx=(8, 0),
         )
-        self._side_cam_lbl_w.pack(side="left", padx=(8, 2))
-        self._side_cam_spin = tk.Spinbox(
-            ctrl2, from_=0, to=9, width=3,
-            textvariable=self._side_cam_idx,
-            bg=BG2, fg=TEXT, buttonbackground=BG2,
-            insertbackground=TEXT, relief="flat",
-            font=("Segoe UI", 10, "bold"),
-        )
-        self._side_cam_spin.pack(side="left", padx=(2, 4))
 
-        self._cam_apply_btn = _btn(
-            ctrl2, "Valtas (kamera/mod)", BG2, ORANGE, self._on_camera_apply,
-        )
-        self._cam_apply_btn.pack(side="left", padx=(8, 0))
-
-        # Mode A/B-ben elrejtjuk a side kamera widget-eket
-        self._update_side_cam_widget_visibility()
-
-        # ── 2. sor: also panel ───────────────────────────────────────────────
+        # Bottom panels — 3 columns: Settings | Joints | Debug
         bottom = tk.Frame(root, bg=BG)
         bottom.grid(row=2, column=0, sticky="nsew", padx=4, pady=(2, 8))
-        bottom.columnconfigure(0, weight=0, minsize=320)
-        bottom.columnconfigure(1, weight=1)
-        bottom.rowconfigure(0, weight=1)
+        bottom.columnconfigure(0, weight=0, minsize=300)   # settings
+        bottom.columnconfigure(1, weight=0, minsize=270)   # joint angles
+        bottom.columnconfigure(2, weight=1)                # live debug
+        bottom.rowconfigure(0, weight=3)                   # main panels
+        bottom.rowconfigure(1, weight=1)                   # log
 
-        # -- Bal: beallitasok --
         self._build_settings(bottom)
+        self._build_joints(bottom)
+        self._build_debug(bottom)
+        self._build_log(bottom)
 
-        # -- Jobb: izuletek + log --
-        self._build_joints_log(bottom)
-
-    # ── Beallitasok panel ─────────────────────────────────────────────────────
+    # ── Settings panel ───────────────────────────────────────────────────────
 
     def _build_settings(self, parent: tk.Frame) -> None:
         sf = tk.LabelFrame(
-            parent, text="  Beallitasok  ",
+            parent, text="  Settings  ",
             bg=BG2, fg=ACCENT, font=("Segoe UI", 9, "bold"),
             relief="flat",
         )
-        sf.grid(row=0, column=0, sticky="nsew", padx=(4, 2), pady=2)
+        sf.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(4, 2), pady=2)
         sf.columnconfigure(2, weight=1)
 
         row = 0
-
-        # ---- One-Euro filter ----
-        tk.Label(sf, text="-- Simitas (One-Euro filter) --",
+        tk.Label(sf, text="-- Smoothing (One-Euro) --",
                  bg=BG2, fg=ACCENT, font=("Segoe UI", 8, "bold"),
                  anchor="w").grid(row=row, column=0, columnspan=3,
                                   sticky="w", padx=4, pady=(6, 2))
         row += 1
-
-        _make_slider(sf, row,
-                     "min_cutoff  (Hz):",
+        _make_slider(sf, row, "min_cutoff (Hz):",
                      self._s_oef_cutoff, 0.1, 5.0, 0.05, fmt=".2f")
         row += 1
-        tk.Label(sf, text="alacsony = simabb, tobb lag",
+        tk.Label(sf, text="low = smoother, more lag",
                  bg=BG2, fg=SUBTEXT, font=("Segoe UI", 7),
                  anchor="w").grid(row=row, column=0, columnspan=3,
                                   sticky="w", padx=4, pady=(0, 4))
         row += 1
-
-        _make_slider(sf, row,
-                     "beta  (sebesseg):",
+        _make_slider(sf, row, "beta (speed):",
                      self._s_oef_beta, 0.0, 0.5, 0.005, fmt=".3f")
         row += 1
-        tk.Label(sf, text="magasabb = kevesebb lag gyors mozgasnal",
+        tk.Label(sf, text="higher = less lag on fast motion",
                  bg=BG2, fg=SUBTEXT, font=("Segoe UI", 7),
                  anchor="w").grid(row=row, column=0, columnspan=3,
                                   sticky="w", padx=4, pady=(0, 6))
         row += 1
 
-        # ---- Lathatosagi kuszob ----
-        tk.Label(sf, text="-- Lathatosagi kuszob --",
+        tk.Label(sf, text="-- Visibility threshold --",
                  bg=BG2, fg=ACCENT, font=("Segoe UI", 8, "bold"),
                  anchor="w").grid(row=row, column=0, columnspan=3,
                                   sticky="w", padx=4, pady=(4, 2))
         row += 1
-        _make_slider(sf, row,
-                     "visibility  thresh:",
+        _make_slider(sf, row, "visibility:",
                      self._s_vis_thresh, 0.1, 0.95, 0.05, fmt=".2f")
         row += 1
-        tk.Label(sf, text="alacsony = lazabb, magasabb = szigorabb",
-                 bg=BG2, fg=SUBTEXT, font=("Segoe UI", 7),
-                 anchor="w").grid(row=row, column=0, columnspan=3,
-                                  sticky="w", padx=4, pady=(0, 6))
-        row += 1
 
-        # ---- IK ----
-        tk.Label(sf, text="-- IK beallitasok --",
-                 bg=BG2, fg=ACCENT, font=("Segoe UI", 8, "bold"),
-                 anchor="w").grid(row=row, column=0, columnspan=3,
-                                  sticky="w", padx=4, pady=(4, 2))
-        row += 1
-        _make_slider(sf, row,
-                     "posture cost:",
-                     self._s_ik_posture, 1e-4, 0.05, 1e-4, fmt=".4f")
-        row += 1
-        tk.Label(sf, text="magasabb = inkabb alap-poz, alacsony = lazabb",
-                 bg=BG2, fg=SUBTEXT, font=("Segoe UI", 7),
-                 anchor="w").grid(row=row, column=0, columnspan=3,
-                                  sticky="w", padx=4, pady=(0, 6))
-        row += 1
-
-        # ---- FPS ----
         tk.Label(sf, text="-- Pipeline FPS --",
                  bg=BG2, fg=ACCENT, font=("Segoe UI", 8, "bold"),
                  anchor="w").grid(row=row, column=0, columnspan=3,
                                   sticky="w", padx=4, pady=(4, 2))
         row += 1
-        _make_slider(sf, row,
-                     "cel FPS:",
+        _make_slider(sf, row, "target FPS:",
                      self._s_fps, 5, 60, 1, fmt=".0f")
         row += 1
-        tk.Label(sf, text="magasabb = folyekonoabb, de tobb CPU",
-                 bg=BG2, fg=SUBTEXT, font=("Segoe UI", 7),
-                 anchor="w").grid(row=row, column=0, columnspan=3,
-                                  sticky="w", padx=4, pady=(0, 6))
-        row += 1
 
-        # ---- Debug mod ----
-        tk.Label(sf, text="-- Debug mod --",
+        tk.Label(sf, text="-- Debug --",
                  bg=BG2, fg=ACCENT, font=("Segoe UI", 8, "bold"),
                  anchor="w").grid(row=row, column=0, columnspan=3,
                                   sticky="w", padx=4, pady=(4, 2))
         row += 1
         tk.Checkbutton(
-            sf, text="Debug overlay + CSV log (debug_log.csv)",
+            sf, text="Debug CSV (debug_log.csv)",
             variable=self._s_debug,
             bg=BG2, fg=TEXT, selectcolor=BG3,
             activebackground=BG2, activeforeground=ACCENT,
@@ -862,35 +644,26 @@ class Real2SimGUI:
         ).grid(row=row, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 6))
         row += 1
 
-        # Alkalmaz gomb
-        _btn(
-            sf, "Beallitasok alkalmazasa", BG3, ACCENT,
-            self._on_apply_settings,
-        ).grid(row=row, column=0, columnspan=3, sticky="ew",
-               padx=4, pady=(4, 8))
+        _btn(sf, "Apply settings", BG3, ACCENT, self._on_apply_settings,
+             ).grid(row=row, column=0, columnspan=3, sticky="ew",
+                    padx=4, pady=(4, 8))
 
-    # ── Izuleti szogek + log panel ───────────────────────────────────────────
+    # ── Joint angles panel (bottom col 1) ───────────────────────────────────
 
-    def _build_joints_log(self, parent: tk.Frame) -> None:
-        right = tk.Frame(parent, bg=BG)
-        right.grid(row=0, column=1, sticky="nsew", padx=(2, 4), pady=2)
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=1)
-        right.rowconfigure(1, weight=2)
-
-        # -- Izuleti szogek --
+    def _build_joints(self, parent: tk.Frame) -> None:
         jf = tk.LabelFrame(
-            right, text="  Izuleti szogek (rad)  ",
+            parent, text="  Joint angles (rad)  ",
             bg=BG, fg=ACCENT, font=("Segoe UI", 9, "bold"),
             relief="flat",
         )
-        jf.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        jf.grid(row=0, column=1, sticky="nsew", padx=(2, 2), pady=(2, 2))
         jf.columnconfigure(0, weight=1)
         jf.columnconfigure(1, weight=1)
+        jf.rowconfigure(1, weight=1)
 
         self._joint_vars: list[tuple[tk.StringVar, ttk.Progressbar]] = []
         names = config.ARM_JOINT_NAMES
-        half  = len(names) // 2
+        half = len(names) // 2
 
         style = ttk.Style()
         style.theme_use("default")
@@ -898,48 +671,162 @@ class Real2SimGUI:
                         background=ACCENT, troughcolor=BG2,
                         bordercolor=BG2, lightcolor=ACCENT, darkcolor=ACCENT)
 
-        for side_idx, side_lbl in enumerate(("Bal kar", "Jobb kar")):
+        for side_idx, side_lbl in enumerate(("Left arm", "Right arm")):
+            tk.Label(jf, text=side_lbl, bg=BG, fg=ACCENT,
+                     font=("Segoe UI", 8, "bold"),
+                     anchor="w").grid(row=0, column=side_idx,
+                                      sticky="ew", padx=4, pady=(2, 0))
             col = tk.Frame(jf, bg=BG)
-            col.grid(row=0, column=side_idx, sticky="nsew", padx=4, pady=4)
-            tk.Label(col, text=side_lbl, bg=BG, fg=ACCENT,
-                     font=("Segoe UI", 8, "bold")).pack(anchor="w")
+            col.grid(row=1, column=side_idx, sticky="nsew", padx=4, pady=2)
             for j in range(half):
                 jname = names[side_idx * half + j]
-                short = (jname
-                         .replace("left_", "L ")
-                         .replace("right_", "R ")
-                         .replace("_joint", ""))
+                short = (jname.replace("left_", "")
+                              .replace("right_", "")
+                              .replace("_joint", "")
+                              .replace("shoulder_", "sh_"))
                 rf = tk.Frame(col, bg=BG)
-                rf.pack(fill="x", pady=1)
-                tk.Label(rf, text=f"{short:<22}", bg=BG, fg=TEXT,
-                         font=("Consolas", 8), width=22,
+                rf.pack(fill="x", pady=0)
+                tk.Label(rf, text=short, bg=BG, fg=TEXT,
+                         font=("Consolas", 8), width=12,
                          anchor="w").pack(side="left")
                 vv = tk.StringVar(value=" 0.000")
                 tk.Label(rf, textvariable=vv, bg=BG, fg=YELLOW,
                          font=("Consolas", 9, "bold"),
                          width=7).pack(side="left")
-                bar = ttk.Progressbar(rf, length=90, mode="determinate",
+                bar = ttk.Progressbar(rf, length=70, mode="determinate",
                                       orient="horizontal",
                                       style="J.Horizontal.TProgressbar")
-                bar.pack(side="left", padx=(4, 0))
+                bar.pack(side="left", padx=(2, 0))
                 bar["value"] = 50
                 self._joint_vars.append((vv, bar))
 
-        # -- Log --
-        lf = tk.LabelFrame(
-            right, text="  Log  ",
+    # ── Live debug panel (bottom col 2) — 2-column Label grid, no scroll ────
+
+    def _build_debug(self, parent: tk.Frame) -> None:
+        df = tk.LabelFrame(
+            parent, text="  Live debug (inputs → math → output)  ",
             bg=BG, fg=ACCENT, font=("Segoe UI", 9, "bold"),
             relief="flat",
         )
-        lf.grid(row=1, column=0, sticky="nsew")
+        df.grid(row=0, column=2, sticky="nsew", padx=(2, 4), pady=(2, 2))
+        df.columnconfigure(0, weight=1)
+        df.columnconfigure(1, weight=1)
+        df.rowconfigure(0, weight=1)
+
+        # Left half: visibility + body vectors
+        left = tk.Frame(df, bg=BG)
+        left.grid(row=0, column=0, sticky="nw", padx=(4, 2), pady=4)
+
+        # Right half: q_raw + anatomical_zero + q_g1_target
+        right = tk.Frame(df, bg=BG)
+        right.grid(row=0, column=1, sticky="nw", padx=(2, 4), pady=4)
+
+        _H = ("Consolas", 8, "bold")
+        _V = ("Consolas", 7)
+
+        def _hdr(frame, row, text):
+            tk.Label(frame, text=text, bg=BG, fg=ACCENT,
+                     font=_H, anchor="w").grid(
+                row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        # ── LEFT: INPUT visibility ───────────────────────────────────────────
+        r = 0
+        _hdr(left, r, "INPUT  visibility"); r += 1
+        vis_names = ["L_sh", "R_sh", "L_el", "R_el", "L_wr", "R_wr", "L_hp", "R_hp"]
+        self._dbg_vis_lbls: dict[str, tk.Label] = {}
+        for row_offset, start in enumerate((0, 4)):
+            row_f = tk.Frame(left, bg=BG)
+            row_f.grid(row=r, column=0, columnspan=4, sticky="w"); r += 1
+            for name in vis_names[start:start + 4]:
+                tk.Label(row_f, text=name + ":", bg=BG, fg=SUBTEXT,
+                         font=_V, anchor="w").pack(side="left")
+                lbl = tk.Label(row_f, text="-.--", bg=BG, fg=TEXT,
+                               font=_V, width=5, anchor="w")
+                lbl.pack(side="left", padx=(0, 4))
+                self._dbg_vis_lbls[name] = lbl
+
+        # ── LEFT: MATH body frame vectors ────────────────────────────────────
+        _hdr(left, r, "MATH   body frame vectors"); r += 1
+        _vec_defs = [
+            ("L_upper", "L_upper_body"),
+            ("L_fore",  "L_fore_body"),
+            ("R_upper", "R_upper_body"),
+            ("R_fore",  "R_fore_body"),
+        ]
+        self._dbg_vec_vars: dict[str, tk.StringVar] = {}
+        for name, key in _vec_defs:
+            row_f = tk.Frame(left, bg=BG)
+            row_f.grid(row=r, column=0, columnspan=4, sticky="w"); r += 1
+            tk.Label(row_f, text=f"  {name:7}", bg=BG, fg=SUBTEXT,
+                     font=_V, width=9, anchor="w").pack(side="left")
+            sv = tk.StringVar(value="x=+0.00 y=+0.00 z=+0.00")
+            tk.Label(row_f, textvariable=sv, bg=BG, fg=YELLOW,
+                     font=_V).pack(side="left")
+            self._dbg_vec_vars[key] = sv
+
+        # ── RIGHT: MATH q_raw ────────────────────────────────────────────────
+        r = 0
+        _hdr(right, r, "MATH   q_raw"); r += 1
+        self._dbg_qraw_lbls: list[tk.Label] = []
+        self._dbg_qraw_strs: list[tk.StringVar] = []
+        for arm in ("L", "R"):
+            row_f = tk.Frame(right, bg=BG)
+            row_f.grid(row=r, column=0, sticky="w"); r += 1
+            tk.Label(row_f, text=f"  {arm}", bg=BG, fg=SUBTEXT,
+                     font=_V, width=3, anchor="w").pack(side="left")
+            sv = tk.StringVar(value="pitch=+0.00 roll=+0.00 elbow=+0.00")
+            lbl = tk.Label(row_f, textvariable=sv, bg=BG, fg=YELLOW, font=_V)
+            lbl.pack(side="left")
+            self._dbg_qraw_lbls.append(lbl)
+            self._dbg_qraw_strs.append(sv)
+
+        # ── RIGHT: CALIB anatomical_zero ─────────────────────────────────────
+        _hdr(right, r, "CALIB  anatomical_zero"); r += 1
+        self._dbg_azero_lbls: list[tk.Label] = []
+        self._dbg_azero_strs: list[tk.StringVar] = []
+        for arm in ("L", "R"):
+            row_f = tk.Frame(right, bg=BG)
+            row_f.grid(row=r, column=0, sticky="w"); r += 1
+            tk.Label(row_f, text=f"  {arm}", bg=BG, fg=SUBTEXT,
+                     font=_V, width=3, anchor="w").pack(side="left")
+            sv = tk.StringVar(value="pitch=+0.00 roll=+0.00 elbow=+0.00")
+            lbl = tk.Label(row_f, textvariable=sv, bg=BG, fg=SUBTEXT, font=_V)
+            lbl.pack(side="left")
+            self._dbg_azero_lbls.append(lbl)
+            self._dbg_azero_strs.append(sv)
+
+        # ── RIGHT: OUTPUT q_g1_target ────────────────────────────────────────
+        _hdr(right, r, "OUTPUT q_g1_target"); r += 1
+        self._dbg_qg1_lbls: list[tk.Label] = []
+        self._dbg_qg1_strs: list[tk.StringVar] = []
+        for arm in ("L", "R"):
+            row_f = tk.Frame(right, bg=BG)
+            row_f.grid(row=r, column=0, sticky="w"); r += 1
+            tk.Label(row_f, text=f"  {arm}", bg=BG, fg=SUBTEXT,
+                     font=_V, width=3, anchor="w").pack(side="left")
+            sv = tk.StringVar(value="pitch=+0.00 roll=+0.00 elbow=+0.00")
+            lbl = tk.Label(row_f, textvariable=sv, bg=BG, fg=GREEN, font=_V)
+            lbl.pack(side="left")
+            self._dbg_qg1_lbls.append(lbl)
+            self._dbg_qg1_strs.append(sv)
+
+    # ── Log panel (bottom row 1, col 1+2) ───────────────────────────────────
+
+    def _build_log(self, parent: tk.Frame) -> None:
+        lf = tk.LabelFrame(
+            parent, text="  Log  ",
+            bg=BG, fg=ACCENT, font=("Segoe UI", 9, "bold"),
+            relief="flat",
+        )
+        lf.grid(row=1, column=1, columnspan=2, sticky="nsew",
+                padx=(2, 4), pady=(0, 2))
         lf.rowconfigure(0, weight=1)
         lf.columnconfigure(0, weight=1)
-
         self._log_text = tk.Text(
             lf, bg=BG2, fg=TEXT,
             font=("Consolas", 8),
             state="disabled", wrap="word",
-            relief="flat", height=6,
+            relief="flat", height=4,
         )
         self._log_text.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(lf, command=self._log_text.yview)
@@ -947,127 +834,35 @@ class Real2SimGUI:
         self._log_text["yscrollcommand"] = sb.set
 
     # =========================================================================
-    # Gomb visszahivasok
+    # Callbacks
     # =========================================================================
-
-    # ── Mode / layout-kezelo metodusok ────────────────────────────────────────
-
-    def _apply_mode_layout(self, mode: str) -> None:
-        """Atrendezi a preview-ket a kivalasztott mode szerint.
-
-        Mode A/B: cam | sim   (1 sor, 2 oszlop)
-        Mode C  : cam | side  (felso sor, 2 oszlop)
-                  sim spans   (also sor, colspan=2)
-        """
-        pr = self._preview_row
-        # Hide all
-        for fr in (self._cam_frame, self._side_cam_frame, self._sim_frame):
-            fr.grid_forget()
-
-        # Reset weights
-        for r in (0, 1):
-            pr.rowconfigure(r, weight=0)
-        for c in (0, 1):
-            pr.columnconfigure(c, weight=0)
-
-        if mode == MODE_FUSION:
-            # 2x2 grid: 2 cams felul, sim alul colspan=2
-            pr.rowconfigure(0, weight=1)
-            pr.rowconfigure(1, weight=1)
-            pr.columnconfigure(0, weight=1)
-            pr.columnconfigure(1, weight=1)
-            self._cam_frame.grid     (row=0, column=0, sticky="nsew", padx=(4, 2), pady=(2, 2))
-            self._side_cam_frame.grid(row=0, column=1, sticky="nsew", padx=(2, 4), pady=(2, 2))
-            self._sim_frame.grid     (row=1, column=0, columnspan=2,
-                                      sticky="nsew", padx=4, pady=(2, 2))
-        else:
-            # 1 sor, 2 oszlop: cam | sim
-            pr.rowconfigure(0, weight=1)
-            pr.columnconfigure(0, weight=1)
-            pr.columnconfigure(1, weight=1)
-            self._cam_frame.grid(row=0, column=0, sticky="nsew", padx=(4, 2), pady=2)
-            self._sim_frame.grid(row=0, column=1, sticky="nsew", padx=(2, 4), pady=2)
-
-    def _update_side_cam_widget_visibility(self) -> None:
-        """Show/hide side cam spinbox + label based on mode."""
-        is_fusion = (self._mode_var.get() == MODE_FUSION)
-        if is_fusion:
-            # Helyezzuk el a 'Valtas' gomb ELE -- az mindig packelve van
-            self._side_cam_lbl_w.pack(side="left", padx=(8, 2),
-                                      before=self._cam_apply_btn)
-            self._side_cam_spin.pack(side="left", padx=(2, 4),
-                                     before=self._cam_apply_btn)
-        else:
-            self._side_cam_lbl_w.pack_forget()
-            self._side_cam_spin.pack_forget()
-
-    def _on_mode_change(self) -> None:
-        """Mode-radio megnyomasa eseten: layout valtas + thread restart."""
-        new_mode = self._mode_var.get()
-        self._apply_mode_layout(new_mode)
-        self._update_side_cam_widget_visibility()
-        self._log_append(
-            f"[{time.strftime('%H:%M:%S')}] Mode valtas -> "
-            f"{MODE_LABELS.get(new_mode, new_mode)}"
-        )
-        self._apply_settings_to_struct()   # settings.mode frissitese az uj modra
-        if self._running:
-            self._log_append(
-                f"[{time.strftime('%H:%M:%S')}] Szal ujrainditasa az uj moddal..."
-            )
-            self._on_stop()
-            self.root.after(300, self._start_thread_with_current)
-
-    # ── Start / Stop / Kalibracio ─────────────────────────────────────────────
 
     def _on_start(self) -> None:
         if self._running:
             return
         self._apply_settings_to_struct()
-        self._start_thread_with_current()
+        self._start_thread()
 
-    def _start_thread_with_current(self) -> None:
-        """Thread inditas az aktualis (mar settingsbe atmasolt) mode-dal."""
-        cam_front = self._cam_idx.get()
-        cam_side  = self._side_cam_idx.get()
-        mode      = self._settings.mode
-
-        if mode == MODE_FUSION and cam_front == cam_side:
-            self._log_append(
-                f"[{time.strftime('%H:%M:%S')}] HIBA: Mode C-ben a front es "
-                f"side kamera index nem lehet azonos (mindketto = {cam_front})."
-            )
-            return
-
+    def _start_thread(self) -> None:
+        cam = self._cam_idx.get()
         self._frame_q = queue.Queue(maxsize=1)
         self._log_q   = queue.Queue()
         self._thread  = SimThread(
-            camera_idx      = cam_front,
-            mirror          = self._mirror.get(),
-            frame_q         = self._frame_q,
-            log_q           = self._log_q,
-            settings        = self._settings,
-            side_camera_idx = cam_side,
+            camera_idx=cam,
+            mirror=self._mirror.get(),
+            frame_q=self._frame_q,
+            log_q=self._log_q,
+            settings=self._settings,
         )
         self._thread.start()
         self._running = True
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._calib_btn.configure(state="normal")
-        self._state_var.set("Fut")
-
-        if mode == MODE_FUSION:
-            self._cam_info.set(f"front={cam_front}, side={cam_side}")
-            self._log_append(
-                f"[{time.strftime('%H:%M:%S')}] Szal inditva mode={MODE_LABELS[mode]} "
-                f"(front={cam_front}, side={cam_side})"
-            )
-        else:
-            self._cam_info.set(f"kamera: {cam_front}")
-            self._log_append(
-                f"[{time.strftime('%H:%M:%S')}] Szal inditva mode={MODE_LABELS[mode]} "
-                f"(kamera={cam_front})"
-            )
+        self._state_var.set("Running")
+        self._log_append(
+            f"[{time.strftime('%H:%M:%S')}] Thread started (camera={cam})",
+        )
 
     def _on_stop(self) -> None:
         if not self._running or self._thread is None:
@@ -1079,47 +874,59 @@ class Real2SimGUI:
         self._start_btn.configure(state="normal")
         self._stop_btn.configure(state="disabled")
         self._calib_btn.configure(state="disabled")
-        self._state_var.set("Leallva")
+        self._state_var.set("Stopped")
         self._fps_var.set("--")
         self._scale_var.set("--")
         if _PIL_OK:
             for lbl, txt in (
-                (self._cam_lbl,      "front nem aktiv"),
-                (self._side_cam_lbl, "side nem aktiv"),
-                (self._sim_lbl,      "sim nem fut"),
+                (self._cam_lbl, "camera not active"),
+                (self._sim_lbl, "sim not running"),
             ):
                 ph = _placeholder_img(480, 320, txt)
                 lbl.configure(image=ph)
                 lbl.image = ph
-        self._log_append(f"[{time.strftime('%H:%M:%S')}] Szal leallitva.")
+        self._log_append(f"[{time.strftime('%H:%M:%S')}] Thread stopped.")
 
     def _on_calibrate(self) -> None:
         if self._thread is not None:
             self._thread.request_calibration()
             self._log_append(
-                f"[{time.strftime('%H:%M:%S')}] Kalibraciot kerest elkuldve -- "
-                "tartsd T-pozban a karjaidat!"
+                f"[{time.strftime('%H:%M:%S')}] Calibration requested -- "
+                "hold T-pose first, then A-pose, then elbows 90°."
+            )
+
+    def _on_clear_calibration(self) -> None:
+        """Delete the cached anatomical_zero so the live pipeline uses the
+        RAW math (no per-user offset). Useful for debugging — lets you see
+        whether the math itself produces sensible angles, independent of any
+        calibration bias."""
+        p = config.CALIBRATION_PATH
+        if p.exists():
+            try:
+                p.unlink()
+                self._log_append(
+                    f"[{time.strftime('%H:%M:%S')}] Cleared {p.name} -- "
+                    "restart pipeline (Stop then Start) to use raw angles."
+                )
+            except OSError as exc:
+                self._log_append(f"Could not delete {p}: {exc}")
+        else:
+            self._log_append(
+                f"[{time.strftime('%H:%M:%S')}] No calibration cache to clear."
             )
 
     def _on_camera_apply(self) -> None:
-        """Kamera/Mode index valtas: ha fut, ujrainditja a szalat."""
-        new_front = self._cam_idx.get()
-        new_side  = self._side_cam_idx.get()
-        mode      = self._mode_var.get()
-        self._apply_settings_to_struct()
+        new_cam = self._cam_idx.get()
         if self._running:
             self._log_append(
-                f"[{time.strftime('%H:%M:%S')}] Valtas -> "
-                f"front={new_front}, side={new_side}, mode={MODE_LABELS.get(mode, mode)} "
-                "(ujrainditom a szalat...)"
+                f"[{time.strftime('%H:%M:%S')}] Switching to camera={new_cam} "
+                "(restarting thread...)"
             )
             self._on_stop()
-            self.root.after(300, self._start_thread_with_current)
+            self.root.after(300, self._start_thread)
         else:
             self._log_append(
-                f"[{time.strftime('%H:%M:%S')}] Beallitva: front={new_front}, "
-                f"side={new_side}, mode={MODE_LABELS.get(mode, mode)} "
-                "(Start-tal indul)"
+                f"[{time.strftime('%H:%M:%S')}] Camera={new_cam} set (Start to begin)"
             )
 
     def _on_mirror_toggle(self) -> None:
@@ -1130,23 +937,16 @@ class Real2SimGUI:
         self._settings.oef_min_cutoff    = float(self._s_oef_cutoff.get())
         self._settings.oef_beta          = float(self._s_oef_beta.get())
         self._settings.visibility_thresh = float(self._s_vis_thresh.get())
-        self._settings.ik_posture_cost   = float(self._s_ik_posture.get())
         self._settings.target_fps        = int(self._s_fps.get())
-        self._settings.mode              = self._mode_var.get()
-        self._settings.side_camera_idx   = int(self._side_cam_idx.get())
         self._settings.debug_mode        = bool(self._s_debug.get())
 
     def _on_apply_settings(self) -> None:
         self._apply_settings_to_struct()
-        # SimThread kozvetlenul olvassa a settings objektumot,
-        # tehat az azonnal ervenyes
         s = self._settings
         self._log_append(
-            f"[{time.strftime('%H:%M:%S')}] Beallitasok alkalmazva: "
+            f"[{time.strftime('%H:%M:%S')}] Settings: "
             f"cutoff={s.oef_min_cutoff:.2f}  beta={s.oef_beta:.3f}  "
-            f"vis={s.visibility_thresh:.2f}  "
-            f"ik_cost={s.ik_posture_cost:.4f}  "
-            f"fps={s.target_fps}"
+            f"vis={s.visibility_thresh:.2f}  fps={s.target_fps}"
         )
 
     def _on_close(self) -> None:
@@ -1155,7 +955,7 @@ class Real2SimGUI:
         self.root.destroy()
 
     # =========================================================================
-    # Log
+    # Log + image update
     # =========================================================================
 
     def _log_append(self, msg: str) -> None:
@@ -1164,12 +964,7 @@ class Real2SimGUI:
         self._log_text.see("end")
         self._log_text.configure(state="disabled")
 
-    # =========================================================================
-    # Kepfrissites (PIL)
-    # =========================================================================
-
     def _update_preview(self, label: tk.Label, arr: np.ndarray, bgr: bool) -> None:
-        """Atmeretezetett kepet jeleniti meg a label-en, kitoltve a rendelkezesre allo helyet."""
         if not _PIL_OK:
             return
         lw = label.winfo_width()
@@ -1178,18 +973,13 @@ class Real2SimGUI:
             lw, lh = 480, 320
 
         import cv2 as _cv
-        if bgr:
-            rgb = _cv.cvtColor(arr, _cv.COLOR_BGR2RGB)
-        else:
-            rgb = arr
+        rgb = _cv.cvtColor(arr, _cv.COLOR_BGR2RGB) if bgr else arr
 
-        # Arany-megtarto fit
         ih, iw = rgb.shape[:2]
         scale  = min(lw / iw, lh / ih)
         nw, nh = int(iw * scale), int(ih * scale)
         img    = Image.fromarray(rgb).resize((nw, nh), Image.BILINEAR)
 
-        # Fekete hatter kozepre
         canvas = Image.new("RGB", (lw, lh), (10, 10, 20))
         ox = (lw - nw) // 2
         oy = (lh - nh) // 2
@@ -1199,10 +989,6 @@ class Real2SimGUI:
         label.configure(image=photo, text="")
         label.image = photo
 
-    # =========================================================================
-    # Izuleti szog frissites
-    # =========================================================================
-
     def _update_joints(self, targets: np.ndarray) -> None:
         PI = 3.14159
         for i, (vv, bar) in enumerate(self._joint_vars):
@@ -1210,32 +996,92 @@ class Real2SimGUI:
             vv.set(f"{a:+.3f}")
             bar["value"] = min(100.0, max(0.0, (a / PI + 1.0) * 50.0))
 
-    # =========================================================================
-    # Poll -- fo szalban, minden POLL_MS ms
-    # =========================================================================
+    # -- Live debug panel (label-based, no scroll) ---------------------------
+
+    def _update_debug(self, dbg: Optional[dict]) -> None:
+        """Push the latest debug dict into the static label grid."""
+        _DASH = "-.--"
+        _ZERO = "pitch=+0.00 roll=+0.00 elbow=+0.00"
+
+        if dbg is None:
+            for lbl in self._dbg_vis_lbls.values():
+                lbl.configure(text=_DASH, fg=SUBTEXT)
+            for sv in self._dbg_vec_vars.values():
+                sv.set("x=+0.00 y=+0.00 z=+0.00")
+            for sv, lbl in zip(self._dbg_qraw_strs, self._dbg_qraw_lbls):
+                sv.set(_ZERO); lbl.configure(fg=SUBTEXT)
+            for sv, lbl in zip(self._dbg_azero_strs, self._dbg_azero_lbls):
+                sv.set(_ZERO); lbl.configure(fg=SUBTEXT)
+            for sv, lbl in zip(self._dbg_qg1_strs, self._dbg_qg1_lbls):
+                sv.set(_ZERO); lbl.configure(fg=SUBTEXT)
+            return
+
+        # Visibility
+        vis = dbg.get("visibility", {})
+        for name, lbl in self._dbg_vis_lbls.items():
+            v = vis.get(name)
+            if v is None:
+                lbl.configure(text=_DASH, fg=SUBTEXT)
+            else:
+                fg = GREEN if v >= 0.8 else (YELLOW if v >= 0.5 else RED)
+                lbl.configure(text=f"{v:.2f}", fg=fg)
+
+        # Body frame vectors
+        for key, sv in self._dbg_vec_vars.items():
+            if key in dbg:
+                x, y, z = dbg[key]
+                sv.set(f"x={x:+.2f} y={y:+.2f} z={z:+.2f}")
+
+        # q_raw (anatomical)
+        if "q_raw" in dbg:
+            q = dbg["q_raw"]
+            for (pi_i, ro_i, el_i), sv, lbl in zip(
+                ((0, 1, 3), (7, 8, 10)),
+                self._dbg_qraw_strs, self._dbg_qraw_lbls,
+            ):
+                sv.set(f"pitch={q[pi_i]:+.2f} roll={q[ro_i]:+.2f} elbow={q[el_i]:+.2f}")
+                lbl.configure(fg=YELLOW)
+
+        # anatomical_zero
+        if "anatomical_zero" in dbg:
+            z = dbg["anatomical_zero"]
+            nonzero = any(abs(v) > 1e-3 for v in z)
+            for (pi_i, ro_i, el_i), sv, lbl in zip(
+                ((0, 1, 3), (7, 8, 10)),
+                self._dbg_azero_strs, self._dbg_azero_lbls,
+            ):
+                sv.set(f"pitch={z[pi_i]:+.2f} roll={z[ro_i]:+.2f} elbow={z[el_i]:+.2f}")
+                lbl.configure(fg=TEXT if nonzero else SUBTEXT)
+
+        # q_g1_target
+        if "q_g1_target" in dbg:
+            q = dbg["q_g1_target"]
+            for (pi_i, ro_i, el_i), sv, lbl in zip(
+                ((0, 1, 3), (7, 8, 10)),
+                self._dbg_qg1_strs, self._dbg_qg1_lbls,
+            ):
+                sv.set(f"pitch={q[pi_i]:+.2f} roll={q[ro_i]:+.2f} elbow={q[el_i]:+.2f}")
+                lbl.configure(fg=GREEN)
 
     def _poll(self) -> None:
-        # Log sorok
         try:
             while True:
                 self._log_append(self._log_q.get_nowait())
         except queue.Empty:
             pass
 
-        # Szal-osszeomlas
         if (self._thread is not None
                 and not self._thread.is_alive()
                 and self._running):
-            err = self._thread.error or "(ismeretlen hiba)"
-            self._log_append(f"HIBA -- szal leallitva:\n{err}")
+            err = self._thread.error or "(unknown error)"
+            self._log_append(f"ERROR -- thread crashed:\n{err}")
             self._running = False
             self._thread  = None
             self._start_btn.configure(state="normal")
             self._stop_btn.configure(state="disabled")
             self._calib_btn.configure(state="disabled")
-            self._state_var.set("HIBA")
+            self._state_var.set("ERROR")
 
-        # Legfrissebb frame
         latest: Optional[SimFrame] = None
         try:
             while True:
@@ -1248,25 +1094,20 @@ class Real2SimGUI:
             self._state_var.set(latest.status)
             if latest.calib is not None:
                 self._scale_var.set(f"{latest.calib.scale:.3f}")
-
             if latest.targets is not None:
                 self._update_joints(latest.targets)
-
+            self._update_debug(latest.debug_info)
             if _PIL_OK:
                 if latest.cam_bgr is not None:
                     self._update_preview(self._cam_lbl, latest.cam_bgr, bgr=True)
                 if latest.sim_rgb is not None:
                     self._update_preview(self._sim_lbl, latest.sim_rgb, bgr=False)
-                if latest.cam_side_bgr is not None:
-                    self._update_preview(
-                        self._side_cam_lbl, latest.cam_side_bgr, bgr=True,
-                    )
 
         self.root.after(POLL_MS, self._poll)
 
 
 # =============================================================================
-# Belepes
+# Entry
 # =============================================================================
 
 def main() -> None:
@@ -1277,7 +1118,7 @@ def main() -> None:
 
     if not _PIL_OK:
         print(
-            "FIGYELEM: Pillow hianzik -- kepmegjelenitoes nem elerheto.\n"
+            "WARNING: Pillow missing -- preview disabled.\n"
             "pip install Pillow",
             file=sys.stderr,
         )

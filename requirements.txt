@@ -3,6 +3,4 @@ numpy
 opencv-python
 mediapipe
 pytest
-mink
-daqp
 Pillow
