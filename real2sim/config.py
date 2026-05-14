@@ -48,14 +48,14 @@ G1_JOINT_SIGN = np.array([
     +1.0,  # L shoulder_pitch  (arm forward → +pitch)
     +1.0,  # L shoulder_roll   (arm out-to-left = +roll)
     +1.0,  # L shoulder_yaw
-    +1.0,  # L elbow           (flexion → +)
+    -1.0,  # L elbow           (see ELBOW_INVERSION note below)
     +1.0,  # L wrist_roll
     +1.0,  # L wrist_pitch
     +1.0,  # L wrist_yaw
     +1.0,  # R shoulder_pitch
     +1.0,  # R shoulder_roll   (formula gives -π/2 for T-pose right, matches MJCF)
     +1.0,  # R shoulder_yaw
-    +1.0,  # R elbow
+    -1.0,  # R elbow           (see ELBOW_INVERSION note below)
     +1.0,  # R wrist_roll
     +1.0,  # R wrist_pitch
     +1.0,  # R wrist_yaw
@@ -65,7 +65,23 @@ G1_JOINT_SIGN = np.array([
 # when the user's natural rest pose is consistently shifted from zero (e.g.
 # shoulders slightly raised). Prefer the per-user anatomical-zero offset
 # captured by run_anthropo_calibration() over hard-coding here.
+#
+# ELBOW_INVERSION:  The G1 robot's elbow joint has the OPPOSITE zero
+# convention from the analytical decomposer in retarget.py:
+#   * Analytical convention (anatomical): elbow=0 means forearm CONTINUES
+#     the upper arm direction (straight arm, like A-pose down).
+#   * G1 MJCF convention (verified empirically with a forward-kinematics
+#     probe of g1.xml): elbow=0 places the forearm PERPENDICULAR to the
+#     upper arm, pointing FORWARD (tray-like). elbow=+π/2 hangs the
+#     forearm STRAIGHT DOWN (A-pose).
+# So we map  q_g1_elbow = -1 * q_anatomical + π/2 .  This makes the
+# user's A-pose (anat=0) correctly drive the robot to +π/2 = forearm
+# down, and the user's tray pose (anat=π/2) drive the robot to 0 =
+# forearm forward.  Without this fix the robot does the opposite of the
+# user (tray ↔ A-pose swap reported by the operator).
 G1_JOINT_OFFSET = np.zeros(14, dtype=np.float64)
+G1_JOINT_OFFSET[3]  = 0.5 * np.pi   # L elbow  (see ELBOW_INVERSION above)
+G1_JOINT_OFFSET[10] = 0.5 * np.pi   # R elbow  (see ELBOW_INVERSION above)
 
 # Joint limits straight from g1.xml (radians). Order = ARM_JOINT_NAMES.
 G1_JOINT_LOWER = np.array([
@@ -91,7 +107,10 @@ VISIBILITY_THRESHOLD = 0.5
 
 # ── Calibration ──────────────────────────────────────────────────────────────
 CALIB_COUNTDOWN_S = 3.0   # "Hold pose" on-screen timer before each pose
-CALIB_COLLECT_S   = 1.5   # Seconds of frames averaged per pose
+CALIB_COLLECT_S   = 3.0   # Seconds of frames averaged per pose — 1.5s gave
+                          # too few valid frames under strict validity checks,
+                          # so the calibrator kept retrying on A-pose and
+                          # never reached the tray phase.
 
 # ── One-Euro filter (raw MediaPipe world landmarks) ──────────────────────────
 OEF_MIN_CUTOFF = 1.0   # Hz — base smoothing
